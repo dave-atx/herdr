@@ -1794,7 +1794,8 @@ impl GhosttyPaneTerminal {
         let (active_screen, primary, alternate, truncated) =
             match core.terminal.active_screen().ok()? {
                 crate::ghostty::ActiveScreen::Primary => {
-                    let text = ghostty_recent_ansi(core, usize::MAX, true).ok()?;
+                    let mut text = ghostty_recent_ansi(core, usize::MAX, true).ok()?;
+                    pad_to_screen_bottom(&core.terminal, &mut text);
                     let (text, truncated) = truncate_history_tail(text, history_limit_bytes);
                     (TerminalScreenKind::Primary, Some(text), None, truncated)
                 }
@@ -3000,6 +3001,27 @@ fn pending_wrap_cell_ansi(terminal: &crate::ghostty::Terminal, x: u16, y: u16) -
 
 /// Keep at most `limit` trailing bytes of history, cut on a line boundary
 /// so the first kept line starts clean. Returns whether anything was cut.
+/// The recent read stops at the last content row, but a client replaying
+/// history plus screen needs the blank rows under the content too: without
+/// them the history scrolls the content down to the bottom and the cursor
+/// position no longer matches. Append one line break per missing row.
+fn pad_to_screen_bottom(terminal: &crate::ghostty::Terminal, text: &mut String) {
+    let Ok(Some((_, end, _))) = ghostty_recent_read_range(terminal, usize::MAX) else {
+        return;
+    };
+    let Ok(total_rows) = terminal.total_rows() else {
+        return;
+    };
+    let last_row = total_rows.saturating_sub(1);
+    let mut missing = last_row.saturating_sub(end);
+    if text.ends_with('\n') {
+        missing = missing.saturating_sub(1);
+    }
+    for _ in 0..missing {
+        text.push_str("\r\n");
+    }
+}
+
 fn truncate_history_tail(text: String, limit: usize) -> (String, bool) {
     if text.len() <= limit {
         return (text, false);
@@ -5216,6 +5238,101 @@ mod tests {
         let row0 = core.terminal.cell_ansi(0, 9, 0).unwrap();
         assert!(row0.contains("abcdefghi"), "row0: {row0:?}");
         assert!(row0.contains('J'), "row0: {row0:?}");
+    }
+
+    /// Full-width rows (a TUI's background bars) replay onto the same rows:
+    /// no line breaks after a row that already filled its last column.
+    #[test]
+    fn raw_snapshot_replays_full_width_rows_without_extra_lines() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let bar = "\x1b[48;5;236m                    \x1b[0m";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"before\r\n");
+        bytes.extend_from_slice(bar.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(b"\x1b[48;5;236m> prompt\x1b[K\x1b[0m\r\n");
+        bytes.extend_from_slice(bar.as_bytes());
+        bytes.extend_from_slice(b"\r\nafter");
+        pane.process_pty_bytes(pane_id, 0, &bytes, &tx);
+        let (original_row, original_text) = {
+            let mut core = pane.core.lock().unwrap();
+            let row = core.terminal.cursor_y().unwrap();
+            (
+                row,
+                ghostty_recent_ansi(&mut core, usize::MAX, false).unwrap(),
+            )
+        };
+        assert_eq!(original_row, 4);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = b"\x1b[2J\x1b[H".to_vec();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(
+            format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1).as_bytes(),
+        );
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let mut core = restored.core.lock().unwrap();
+        let restored_text = ghostty_recent_ansi(&mut core, usize::MAX, false).unwrap();
+        assert_eq!(
+            restored_text, original_text,
+            "primary: {:?}",
+            snapshot.primary
+        );
+        assert_eq!(core.terminal.cursor_y().unwrap(), original_row);
+        let after = core.terminal.cell_ansi(0, 19, 4).unwrap();
+        assert!(after.contains("after"), "row4: {after:?}");
+    }
+
+    /// With history above the screen and blank rows under the content, the
+    /// replay must still land the content on the same screen rows: the
+    /// blank rows are part of the screen, so the snapshot carries them.
+    #[test]
+    fn raw_snapshot_replays_blank_screen_rows_below_the_content() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let mut bytes = Vec::new();
+        for n in 0..12 {
+            bytes.extend_from_slice(format!("history {n}\r\n").as_bytes());
+        }
+        // Clear the screen the way a TUI starts, draw three rows, park the
+        // cursor on the second.
+        bytes.extend_from_slice(b"\x1b[2J\x1b[Hrow0\r\nrow1\r\nrow2\x1b[2;3H");
+        pane.process_pty_bytes(pane_id, 0, &bytes, &tx);
+        let (original_row, original_text) = {
+            let mut core = pane.core.lock().unwrap();
+            let row = core.terminal.cursor_y().unwrap();
+            (row, ghostty_recent_ansi(&mut core, 8, false).unwrap())
+        };
+        assert_eq!(original_row, 1);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = b"\x1b[3J\x1b[2J\x1b[H".to_vec();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(
+            format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1).as_bytes(),
+        );
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let mut core = restored.core.lock().unwrap();
+        let restored_text = ghostty_recent_ansi(&mut core, 8, false).unwrap();
+        assert_eq!(
+            restored_text, original_text,
+            "primary: {:?}",
+            snapshot.primary
+        );
+        let row1 = core.terminal.cell_ansi(0, 19, 1).unwrap();
+        assert!(row1.contains("row1"), "row1: {row1:?}");
+        assert_eq!(core.terminal.cursor_y().unwrap(), 1);
     }
 
     /// A wide glyph on the last two columns puts the cursor on its spacer
