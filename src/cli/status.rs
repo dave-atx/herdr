@@ -282,6 +282,7 @@ struct ServerCapabilitiesJson {
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
     health_check: bool,
+    terminal_control_stream: u32,
 }
 
 #[derive(Serialize)]
@@ -325,6 +326,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
+                    terminal_control_stream: capabilities.terminal_control_stream,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
@@ -416,6 +418,8 @@ mod tests {
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
+                terminal_control_stream: 0,
+                server_pid: None,
             }),
         }
     }

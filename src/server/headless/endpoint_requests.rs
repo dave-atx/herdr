@@ -124,6 +124,7 @@ impl HeadlessServer {
                     respond_to,
                     response_write_complete: None,
                     stream_active: None,
+                    control: None,
                 },
             )
     }

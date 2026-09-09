@@ -3,6 +3,466 @@
   "protocol": 22,
   "schema_version": 1,
   "schemas": {
+    "control_record": {
+      "$defs": {
+        "PaneLayoutPane": {
+          "properties": {
+            "focused": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "rect": {
+              "$ref": "#/schemas/control_record/$defs/PaneLayoutRect"
+            }
+          },
+          "required": [
+            "pane_id",
+            "focused",
+            "rect"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutRect": {
+          "properties": {
+            "height": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "width": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "x": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "y": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutSnapshot": {
+          "properties": {
+            "area": {
+              "$ref": "#/schemas/control_record/$defs/PaneLayoutRect"
+            },
+            "focused_pane_id": {
+              "type": "string"
+            },
+            "panes": {
+              "items": {
+                "$ref": "#/schemas/control_record/$defs/PaneLayoutPane"
+              },
+              "type": "array"
+            },
+            "splits": {
+              "items": {
+                "$ref": "#/schemas/control_record/$defs/PaneLayoutSplit"
+              },
+              "type": "array"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            },
+            "zoomed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "tab_id",
+            "zoomed",
+            "area",
+            "focused_pane_id",
+            "panes",
+            "splits"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutSplit": {
+          "properties": {
+            "direction": {
+              "$ref": "#/schemas/control_record/$defs/SplitDirection"
+            },
+            "id": {
+              "type": "string"
+            },
+            "ratio": {
+              "format": "float",
+              "type": "number"
+            },
+            "rect": {
+              "$ref": "#/schemas/control_record/$defs/PaneLayoutRect"
+            }
+          },
+          "required": [
+            "id",
+            "direction",
+            "ratio",
+            "rect"
+          ],
+          "type": "object"
+        },
+        "PaneScrollInfo": {
+          "properties": {
+            "max_offset_from_bottom": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "offset_from_bottom": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "viewport_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "offset_from_bottom",
+            "max_offset_from_bottom",
+            "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "SplitDirection": {
+          "enum": [
+            "right",
+            "down"
+          ],
+          "type": "string"
+        },
+        "TerminalCursorInfo": {
+          "properties": {
+            "shape": {
+              "description": "DECSCUSR parameter (0 to 6).",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "visible": {
+              "type": "boolean"
+            },
+            "x": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "y": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "visible",
+            "shape"
+          ],
+          "type": "object"
+        },
+        "TerminalDetachReason": {
+          "enum": [
+            "takeover",
+            "closed"
+          ],
+          "type": "string"
+        },
+        "TerminalScreenKind": {
+          "enum": [
+            "primary",
+            "alternate"
+          ],
+          "type": "string"
+        },
+        "TerminalSnapshot": {
+          "description": "Atomic capture of a terminal taken at attach or on request. Output\nrecords with `seq` greater than this snapshot's `seq` were produced\nafter it.",
+          "properties": {
+            "active_screen": {
+              "$ref": "#/schemas/control_record/$defs/TerminalScreenKind"
+            },
+            "alternate": {
+              "description": "Alternate screen contents as ANSI when it is active.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cursor": {
+              "$ref": "#/schemas/control_record/$defs/TerminalCursorInfo"
+            },
+            "primary": {
+              "description": "Primary screen scrollback plus screen as unwrapped ANSI. Absent when\nthe alternate screen is active, because only the active screen can\nbe read.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "$ref": "#/schemas/control_record/$defs/TerminalStateInfo"
+            },
+            "state_ansi": {
+              "description": "Mode and keyboard-protocol sequences that restore terminal state.",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "True when `history_limit_bytes` cut older history.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "seq",
+            "active_screen",
+            "state_ansi",
+            "cursor",
+            "state",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "TerminalStateInfo": {
+          "description": "Terminal facts captured with the snapshot. Everything here is also\nencoded in `state_ansi`; the fields exist so a client can read them\nwithout parsing.",
+          "properties": {
+            "application_cursor": {
+              "type": "boolean"
+            },
+            "bracketed_paste": {
+              "type": "boolean"
+            },
+            "color_scheme_reporting": {
+              "type": "boolean"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus_reporting": {
+              "type": "boolean"
+            },
+            "kitty_keyboard_flags": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "modify_other_keys_level": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mouse_alternate_scroll": {
+              "type": "boolean"
+            },
+            "mouse_reporting": {
+              "type": "boolean"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scroll": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/control_record/$defs/PaneScrollInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sgr_pixel_mouse": {
+              "type": "boolean"
+            },
+            "synchronized_output": {
+              "type": "boolean"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "cols",
+            "rows",
+            "application_cursor",
+            "bracketed_paste",
+            "focus_reporting",
+            "mouse_reporting",
+            "sgr_pixel_mouse",
+            "mouse_alternate_scroll",
+            "synchronized_output",
+            "color_scheme_reporting",
+            "kitty_keyboard_flags",
+            "modify_other_keys_level"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Records pushed on a control stream outside request/response pairs.",
+      "oneOf": [
+        {
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            },
+            "snapshot": {
+              "$ref": "#/schemas/control_record/$defs/TerminalSnapshot"
+            },
+            "type": {
+              "const": "terminal.snapshot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attach_id",
+            "snapshot"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            },
+            "bytes": {
+              "description": "Base64 raw PTY bytes.",
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "terminal.output",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attach_id",
+            "seq",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Output was dropped because the client fell behind; request\n`terminal.snapshot` to resynchronize.",
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            },
+            "dropped_bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "terminal.gap",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attach_id",
+            "seq",
+            "dropped_bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/schemas/control_record/$defs/TerminalDetachReason"
+            },
+            "type": {
+              "const": "terminal.detached",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attach_id",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A tab's pane rectangles as the terminals were (or are about to be)\nsized, ordered on the stream ahead of any output drawn at the new\nsize. Sent for every tab geometry change while a control stream is\nopen, whichever client caused it.",
+          "properties": {
+            "layout": {
+              "$ref": "#/schemas/control_record/$defs/PaneLayoutSnapshot"
+            },
+            "type": {
+              "const": "tab.layout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "layout"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ControlRecord"
+    },
     "error_response": {
       "$defs": {
         "ErrorBody": {
@@ -1751,6 +2211,9 @@
           "required": [
             "command_id"
           ],
+          "type": "object"
+        },
+        "ControlOpenParams": {
           "type": "object"
         },
         "EmptyParams": {
@@ -4412,6 +4875,43 @@
           ],
           "type": "object"
         },
+        "TabSetGeometryParams": {
+          "properties": {
+            "cell_height_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
         "TabTarget": {
           "properties": {
             "tab_id": {
@@ -4420,6 +4920,176 @@
           },
           "required": [
             "tab_id"
+          ],
+          "type": "object"
+        },
+        "TerminalAttachGeometry": {
+          "description": "Who decides the pane's size while the attach owns the terminal.",
+          "oneOf": [
+            {
+              "const": "tab",
+              "description": "Sizes follow the tab layout; the client drives it with `tab.set_geometry`.",
+              "type": "string"
+            },
+            {
+              "const": "terminal",
+              "description": "The client sizes this one terminal with `terminal.resize` and Herdr\nlocks the tab layout out of it, like a direct terminal attach.",
+              "type": "string"
+            }
+          ]
+        },
+        "TerminalAttachMode": {
+          "oneOf": [
+            {
+              "const": "raw",
+              "description": "Stream the pane's raw PTY output bytes.",
+              "type": "string"
+            }
+          ]
+        },
+        "TerminalAttachParams": {
+          "properties": {
+            "answer_queries": {
+              "$ref": "#/schemas/request/$defs/TerminalQueryAuthority",
+              "default": "client"
+            },
+            "cell_height_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "geometry": {
+              "$ref": "#/schemas/request/$defs/TerminalAttachGeometry",
+              "default": "tab"
+            },
+            "history_limit_bytes": {
+              "description": "Upper bound on primary-screen history bytes in the snapshot.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "mode": {
+              "$ref": "#/schemas/request/$defs/TerminalAttachMode",
+              "default": "raw"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "takeover": {
+              "default": false,
+              "type": "boolean"
+            },
+            "target": {
+              "description": "Pane id, terminal id, or agent name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "TerminalAttachTarget": {
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "attach_id"
+          ],
+          "type": "object"
+        },
+        "TerminalInputParams": {
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            },
+            "bytes": {
+              "description": "Base64 bytes written to the PTY verbatim.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "attach_id",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        "TerminalQueryAuthority": {
+          "description": "Which terminal emulator answers queries the pane application sends\n(device attributes, XTGETTCAP, OSC color queries).",
+          "oneOf": [
+            {
+              "const": "client",
+              "description": "The attaching client answers; Herdr suppresses its own replies while\nthe attach owns the terminal.",
+              "type": "string"
+            },
+            {
+              "const": "server",
+              "description": "Herdr keeps answering as it does for every other client.",
+              "type": "string"
+            }
+          ]
+        },
+        "TerminalResizeParams": {
+          "properties": {
+            "attach_id": {
+              "type": "string"
+            },
+            "cell_height_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "attach_id",
+            "cols",
+            "rows"
           ],
           "type": "object"
         },
@@ -6371,6 +7041,134 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "control.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ControlOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "control.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.attach",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalAttachParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.detach",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalAttachTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.snapshot",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalAttachTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.resize",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalResizeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.set_geometry",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabSetGeometryParams"
             }
           },
           "required": [
@@ -10510,6 +11308,77 @@
               "type": "object"
             },
             {
+              "description": "A control stream is open on this connection.",
+              "properties": {
+                "boot_id": {
+                  "type": "string"
+                },
+                "capabilities": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/ServerCapabilities"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "connection_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "protocol": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "control_opened",
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "connection_id",
+                "boot_id",
+                "version",
+                "protocol"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A raw terminal attach is live; its `terminal.snapshot` record follows.",
+              "properties": {
+                "attach_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "terminal_attached",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "attach_id",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "ok",
@@ -10546,10 +11415,26 @@
             "live_handoff": {
               "type": "boolean"
             },
+            "server_pid": {
+              "description": "Process id of the server, for clients that key state on a server instance.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "surface_interest": {
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
               "type": "boolean"
+            },
+            "terminal_control_stream": {
+              "default": 0,
+              "description": "Control stream protocol supported by this server; 0 when unsupported.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             }
           },
           "required": [

@@ -329,10 +329,12 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 herdr terminal attach <terminal_id> [--takeover]
 herdr terminal title set <title>
 herdr terminal title clear
+herdr [--session <name>] control
 ```
 
 ダイレクトアタッチからは `ctrl+b q` でデタッチします。リテラルの `ctrl+b` は `ctrl+b ctrl+b` で送ります。
 `terminal title clear` は外側ターミナルウィンドウタイトルを `ui.window_title` に戻します。
+`control` はソケット API のコントロールストリームを開き、改行区切りの JSON として stdin と stdout に橋渡しします。最初に出力される行はサーバーの boot id と capabilities を含む `control.open` のレスポンスで、stdin に書いたリクエストのレスポンス、購読イベント、生の `terminal.*` レコードは stdout に届きます。独自のターミナルエミュレータでペインを描画する SSH exec チャネル上のクライアントのためのもので、`terminal.attach` 系のメソッドはソケット API のドキュメントを参照してください。stdin の EOF でストリームを閉じます。
 
 ## 出力待機
 

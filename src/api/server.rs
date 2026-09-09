@@ -22,6 +22,7 @@ use crate::ipc::{
     socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
+mod control_stream;
 mod pane_graphics_stream;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -64,13 +65,15 @@ pub(crate) fn start_server_with_stop_control(
     start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
 }
 
-fn default_capabilities() -> Option<ServerCapabilities> {
+pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        terminal_control_stream: crate::api::control::CONTROL_STREAM_PROTOCOL,
+        server_pid: Some(std::process::id()),
     })
 }
 
@@ -200,6 +203,28 @@ fn handle_connection_with_stop(
         Method::PaneGraphicsStream(params) => {
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::ControlOpen(_) => {
+            let result = control_stream::serve(
+                stream,
+                request_id.clone(),
+                api_tx,
+                event_hub,
+                running,
+                capabilities,
+            );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -491,6 +516,14 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PluginPaneOpen(_) => "plugin.pane.open",
         Method::PluginPaneFocus(_) => "plugin.pane.focus",
         Method::PluginPaneClose(_) => "plugin.pane.close",
+        Method::ControlOpen(_) => "control.open",
+        Method::ControlClose(_) => "control.close",
+        Method::TerminalAttach(_) => "terminal.attach",
+        Method::TerminalDetach(_) => "terminal.detach",
+        Method::TerminalInput(_) => "terminal.input",
+        Method::TerminalSnapshot(_) => "terminal.snapshot",
+        Method::TerminalResize(_) => "terminal.resize",
+        Method::TabSetGeometry(_) => "tab.set_geometry",
     }
 }
 
@@ -851,6 +884,14 @@ pub(super) fn dispatch_stream_frame(
     )
 }
 
+pub(super) fn dispatch_to_app_with_control(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    control: crate::api::control::ControlConnectionHandle,
+) -> String {
+    dispatch_to_app_inner(request, api_tx, None, None, None, None, Some(control))
+}
+
 fn dispatch_to_app(
     request: Request,
     api_tx: &ApiRequestSender,
@@ -858,6 +899,26 @@ fn dispatch_to_app(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream_active: Option<Arc<AtomicBool>>,
     timeout_response: Option<(&str, &str)>,
+) -> String {
+    dispatch_to_app_inner(
+        request,
+        api_tx,
+        timeout,
+        response_write_complete,
+        stream_active,
+        timeout_response,
+        None,
+    )
+}
+
+fn dispatch_to_app_inner(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    stream_active: Option<Arc<AtomicBool>>,
+    timeout_response: Option<(&str, &str)>,
+    control: Option<crate::api::control::ControlConnectionHandle>,
 ) -> String {
     let request_id = request.id.clone();
     let request_active = stream_active.clone();
@@ -867,6 +928,7 @@ fn dispatch_to_app(
         respond_to,
         response_write_complete,
         stream_active,
+        control,
     }) {
         if let Some(active) = request_active {
             active.store(false, Ordering::Release);
@@ -1149,6 +1211,8 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                terminal_control_stream: 0,
+                server_pid: None,
             }),
             None,
             None,

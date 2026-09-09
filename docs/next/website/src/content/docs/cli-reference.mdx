@@ -351,6 +351,7 @@ herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
 herdr terminal title set <title>
 herdr terminal title clear
+herdr [--session <name>] control
 ```
 
 Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
@@ -366,6 +367,13 @@ records with base64-encoded ANSI bytes, then a `terminal.closed` record when
 the server closes the stream. Multiple observers can watch the same terminal
 without taking input, resize, scroll, or takeover authority.
 `terminal title clear` hands the outer terminal window title back to `ui.window_title`.
+`control` opens a socket API control stream and bridges it to stdin and stdout
+as newline-delimited JSON. The first line printed is the `control.open`
+response with the server's boot id and capabilities; requests written to stdin
+get their responses, subscription events, and raw `terminal.*` records on
+stdout. It exists for clients on an SSH exec channel that render panes with
+their own terminal emulator; the socket API documentation covers the
+`terminal.attach` family. EOF on stdin closes the stream.
 
 ## Output waits
 

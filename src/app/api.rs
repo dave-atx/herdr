@@ -1221,6 +1221,20 @@ impl App {
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
             }
+            Method::ControlOpen(_)
+            | Method::ControlClose(_)
+            | Method::TerminalAttach(_)
+            | Method::TerminalDetach(_)
+            | Method::TerminalInput(_)
+            | Method::TerminalSnapshot(_)
+            | Method::TerminalResize(_)
+            | Method::TabSetGeometry(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "control_stream_required",
+                    "this method is only available on a control stream served by the headless server",
+                );
+            }
             _ => {
                 return responses::encode_error(
                     request.id,

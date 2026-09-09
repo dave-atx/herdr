@@ -41,6 +41,8 @@ use super::{
 const DEFAULT_DETECTION_ROWS: usize = 24;
 const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
+const MODE_ORIGIN: u16 = 6;
+const MODE_AUTOWRAP: u16 = 7;
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
 const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
@@ -260,6 +262,17 @@ impl PaneTerminal {
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
         self.ghostty.scroll_metrics()
+    }
+
+    pub(crate) fn raw_snapshot(
+        &self,
+        seq: u64,
+        history_limit_bytes: usize,
+        title: Option<String>,
+        cwd: Option<String>,
+    ) -> Option<crate::api::schema::TerminalSnapshot> {
+        self.ghostty
+            .raw_snapshot(seq, history_limit_bytes, title, cwd)
     }
 
     pub(crate) fn search_text_window(
@@ -1755,6 +1768,165 @@ impl GhosttyPaneTerminal {
         })
     }
 
+    /// Capture the active screen, terminal modes, and cursor for a raw
+    /// control-stream attach. The caller holds the pane content lock so the
+    /// snapshot is ordered against PTY output.
+    pub(crate) fn raw_snapshot(
+        &self,
+        seq: u64,
+        history_limit_bytes: usize,
+        title: Option<String>,
+        cwd: Option<String>,
+    ) -> Option<crate::api::schema::TerminalSnapshot> {
+        use crate::api::schema::{
+            PaneScrollInfo, TerminalCursorInfo, TerminalScreenKind, TerminalSnapshot,
+            TerminalStateInfo,
+        };
+
+        let mut core = self.core.lock().ok()?;
+        let core = &mut *core;
+        let cols = core.terminal.cols().ok()?;
+        let rows = core.terminal.rows().ok()?;
+        let (active_screen, primary, alternate, truncated) =
+            match core.terminal.active_screen().ok()? {
+                crate::ghostty::ActiveScreen::Primary => {
+                    let text = ghostty_recent_ansi(core, usize::MAX, true).ok()?;
+                    let (text, truncated) = truncate_history_tail(text, history_limit_bytes);
+                    (TerminalScreenKind::Primary, Some(text), None, truncated)
+                }
+                crate::ghostty::ActiveScreen::Alternate => {
+                    let text = ghostty_recent_ansi(core, usize::MAX, false).ok()?;
+                    (TerminalScreenKind::Alternate, None, Some(text), false)
+                }
+            };
+
+        // The active cursor, not the viewport's: another client may have
+        // scrolled this pane back, which must not move the client's cursor.
+        let shape = current_cursor_state(core).map_or(0, |cursor| cursor.shape);
+        let cursor = TerminalCursorState {
+            x: core.terminal.cursor_x().unwrap_or(0),
+            y: core.terminal.cursor_y().unwrap_or(0),
+            visible: core.terminal.cursor_visible().unwrap_or(true),
+            shape,
+        };
+
+        let terminal = &core.terminal;
+        let mode = |mode: u16| terminal.mode_get(mode).unwrap_or(false);
+        let application_cursor = mode(crate::ghostty::MODE_APPLICATION_CURSOR_KEYS);
+        let bracketed_paste = mode(crate::ghostty::MODE_BRACKETED_PASTE);
+        let focus_reporting = mode(crate::ghostty::MODE_FOCUS_EVENT);
+        let sgr_pixel_mouse = mode(crate::ghostty::MODE_MOUSE_SGR_PIXELS);
+        let mouse_alternate_scroll = mode(crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL);
+        let synchronized_output = mode(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT);
+        let color_scheme_reporting = mode(crate::ghostty::MODE_COLOR_SCHEME_REPORT);
+        let mouse_reporting = terminal.mouse_tracking_enabled().unwrap_or(false);
+        let kitty_keyboard_flags = u16::from(terminal.kitty_keyboard_flags().unwrap_or(0));
+
+        // Modes are listed by hand so the alternate-screen switch and
+        // synchronized output stay out: the client composes the screen switch
+        // itself, and replaying `?2026h` would freeze its rendering until the
+        // app ends the batch. Scrolling regions, tab stops, charsets, and the
+        // keyboard protocols come from the formatter below.
+        let mut state_ansi = String::new();
+        for (number, enabled) in [
+            (
+                crate::ghostty::MODE_APPLICATION_CURSOR_KEYS,
+                application_cursor,
+            ),
+            (MODE_ORIGIN, mode(MODE_ORIGIN)),
+            (MODE_AUTOWRAP, mode(MODE_AUTOWRAP)),
+            (MODE_MOUSE_X10, mode(MODE_MOUSE_X10)),
+            (MODE_MOUSE_PRESS_RELEASE, mode(MODE_MOUSE_PRESS_RELEASE)),
+            (MODE_MOUSE_BUTTON_MOTION, mode(MODE_MOUSE_BUTTON_MOTION)),
+            (MODE_MOUSE_ANY_MOTION, mode(MODE_MOUSE_ANY_MOTION)),
+            (crate::ghostty::MODE_FOCUS_EVENT, focus_reporting),
+            (
+                crate::ghostty::MODE_MOUSE_UTF8,
+                mode(crate::ghostty::MODE_MOUSE_UTF8),
+            ),
+            (
+                crate::ghostty::MODE_MOUSE_SGR,
+                mode(crate::ghostty::MODE_MOUSE_SGR),
+            ),
+            (
+                crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL,
+                mouse_alternate_scroll,
+            ),
+            (crate::ghostty::MODE_MOUSE_SGR_PIXELS, sgr_pixel_mouse),
+            (crate::ghostty::MODE_BRACKETED_PASTE, bracketed_paste),
+            (
+                crate::ghostty::MODE_GRAPHEME_CLUSTER,
+                mode(crate::ghostty::MODE_GRAPHEME_CLUSTER),
+            ),
+            (
+                crate::ghostty::MODE_COLOR_SCHEME_REPORT,
+                color_scheme_reporting,
+            ),
+        ] {
+            state_ansi.push_str(&format!(
+                "\x1b[?{number}{}",
+                if enabled { 'h' } else { 'l' }
+            ));
+        }
+        if let Ok(extra) = terminal.raw_attach_state_ansi() {
+            state_ansi.push_str(&extra);
+        }
+        // The tracker replays the pushed Kitty keyboard stack, not just the
+        // current flags, so a later pop lands on the same state client side.
+        if let Some(keyboard) = core.kitty_keyboard.replay_ansi() {
+            state_ansi.push_str(&keyboard);
+        }
+        state_ansi.push_str(if cursor.visible {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
+        });
+        if cursor.shape > 0 {
+            state_ansi.push_str(&format!("\x1b[{} q", cursor.shape));
+        }
+
+        let scroll = terminal.scrollbar().ok().map(|scrollbar| PaneScrollInfo {
+            offset_from_bottom: scrollbar
+                .total
+                .saturating_sub(scrollbar.offset + scrollbar.len)
+                as u64,
+            max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len) as u64,
+            viewport_rows: scrollbar.len as u64,
+        });
+
+        Some(TerminalSnapshot {
+            seq,
+            active_screen,
+            primary,
+            alternate,
+            state_ansi,
+            cursor: TerminalCursorInfo {
+                x: cursor.x,
+                y: cursor.y,
+                visible: cursor.visible,
+                shape: cursor.shape,
+            },
+            state: TerminalStateInfo {
+                cols,
+                rows,
+                application_cursor,
+                bracketed_paste,
+                focus_reporting,
+                mouse_reporting,
+                sgr_pixel_mouse,
+                mouse_alternate_scroll,
+                synchronized_output,
+                color_scheme_reporting,
+                kitty_keyboard_flags,
+                modify_other_keys_level: core.kitty_keyboard.modify_other_keys_level(),
+                title,
+                cwd,
+                scroll,
+            },
+            truncated,
+        })
+    }
+
     pub fn keyboard_protocol(&self) -> Option<crate::input::KeyboardProtocol> {
         let Ok(core) = self.core.lock() else {
             return None;
@@ -2777,6 +2949,30 @@ fn ghostty_recent_ansi(
     unwrap: bool,
 ) -> Result<String, crate::ghostty::Error> {
     ghostty_recent_ansi_snapshot(core, lines, unwrap).map(|snapshot| snapshot.text)
+}
+
+#[cfg(test)]
+pub(super) fn truncate_history_tail_for_test(text: String, limit: usize) -> (String, bool) {
+    truncate_history_tail(text, limit)
+}
+
+/// Keep at most `limit` trailing bytes of history, cut on a line boundary
+/// so the first kept line starts clean. Returns whether anything was cut.
+fn truncate_history_tail(text: String, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text, false);
+    }
+    // Move onto a char boundary before slicing; the limit may land inside a
+    // multibyte character.
+    let mut start = text.len() - limit;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = text[start..]
+        .find('\n')
+        .map(|offset| start + offset + 1)
+        .unwrap_or(start);
+    (text[cut..].to_string(), true)
 }
 
 fn ghostty_recent_ansi_snapshot(
@@ -4843,6 +5039,71 @@ mod tests {
             restored.keyboard_protocol(),
             Some(crate::input::KeyboardProtocol::Kitty { flags: 1 })
         );
+    }
+
+    /// A raw attach snapshot replays the pushed Kitty keyboard stack and the
+    /// scrolling region without any screen content in `state_ansi`.
+    #[test]
+    fn raw_snapshot_state_replays_keyboard_stack_without_content() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"SECRET-CONTENT\x1b[>1u\x1b[>5u\x1b[3;10r", &tx);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(
+            !snapshot.state_ansi.contains("SECRET"),
+            "state: {:?}",
+            snapshot.state_ansi
+        );
+        assert!(snapshot.state_ansi.contains("\x1b[>1u\x1b[>5u"));
+        assert!(snapshot.state_ansi.contains("\x1b[3;10r"));
+        // Cursor sits after the text; the scrolling region moved it home.
+        assert_eq!((snapshot.cursor.x, snapshot.cursor.y), (0, 0));
+        assert!(snapshot
+            .primary
+            .as_deref()
+            .is_some_and(|primary| primary.contains("SECRET-CONTENT")));
+
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        restored.process_pty_bytes(pane_id, 0, snapshot.state_ansi.as_bytes(), &restored_tx);
+        restored.process_pty_bytes(pane_id, 0, b"\x1b[<u", &restored_tx);
+        assert_eq!(
+            restored.keyboard_protocol(),
+            Some(crate::input::KeyboardProtocol::Kitty { flags: 1 })
+        );
+    }
+
+    /// The pen survives an attach: text typed after the snapshot keeps the
+    /// attributes the app had set, and the cursor is the active one even
+    /// when this pane is scrolled back.
+    #[test]
+    fn raw_snapshot_state_carries_the_pen_and_active_cursor() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 4, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let mut lines = Vec::new();
+        for n in 0..12 {
+            lines.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        lines.extend_from_slice(b"A\x1b[31m\x1b[?25l");
+        pane.process_pty_bytes(pane_id, 0, &lines, &tx);
+        pane.scroll_up(5);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(
+            snapshot.state_ansi.contains("\x1b[31m")
+                || snapshot.state_ansi.contains("\x1b[38;5;1m"),
+            "state: {:?}",
+            snapshot.state_ansi
+        );
+        assert_eq!(snapshot.cursor.x, 1);
+        assert_eq!(snapshot.cursor.y, 3);
+        assert!(!snapshot.cursor.visible);
     }
 
     #[cfg(windows)]

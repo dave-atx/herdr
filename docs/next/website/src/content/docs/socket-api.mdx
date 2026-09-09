@@ -834,6 +834,79 @@ Worktree event subscriptions include `worktree.created`, `worktree.opened`, and 
 
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
 
+## Control streams
+
+A control stream is one connection a client keeps open to drive Herdr the way a
+terminal emulator would. It multiplexes ordinary requests, event subscriptions,
+and raw terminal output for panes the client renders itself. Servers that
+support it advertise `terminal_control_stream` in `ping` capabilities
+(currently `1`), and `herdr control` bridges one to stdin and stdout so an SSH
+exec channel can carry it without a PTY.
+
+Open the stream with `control.open` as the first request on a fresh connection.
+The response reports the server `boot_id`, `connection_id`, version, protocol,
+and capabilities. Every later line on the connection is a request; responses,
+pushed subscription events, and terminal records share the socket in one order.
+`events.subscribe` adds subscriptions to the same connection instead of taking
+it over, and `ping` answers locally. Blocking helpers (`events.wait`,
+`agent.wait`, `agent.prompt`, `pane.wait_for_output`) and `pane.graphics.stream`
+are refused with `unsupported_in_control_stream`; use a separate connection for
+them. `control.close`, or closing the connection, releases everything the stream
+owned.
+
+```json
+{"id":"c","method":"control.open","params":{}}
+{"id":"a","method":"terminal.attach","params":{"target":"w1:p1","answer_queries":"client","history_limit_bytes":1048576}}
+{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16}}
+{"id":"i","method":"terminal.input","params":{"attach_id":"1-0","bytes":"bHMK"}}
+{"id":"s","method":"terminal.snapshot","params":{"attach_id":"1-0"}}
+{"id":"d","method":"terminal.detach","params":{"attach_id":"1-0"}}
+```
+
+`terminal.attach` takes a pane id, terminal id, or agent name and makes the
+stream the writable owner of that terminal, like a direct attach; pass
+`takeover: true` to evict another owner. The response carries the `attach_id`,
+and the first record for it is `terminal.snapshot`: the active screen as ANSI
+(`primary` with unwrapped scrollback, or `alternate`), `state_ansi` with the
+sequences that restore terminal state (modes, scrolling region, tab stops,
+charsets, the active pen, and the keyboard protocols including the pushed
+Kitty stack), the cursor, and a `state` object with the same facts as fields.
+Any escape sequence a PTY read left unfinished follows the snapshot as the
+first `terminal.output` record, so the client parses it whole. The snapshot is taken under
+the pane's output lock, so every `terminal.output` record with a higher `seq`
+was produced after it. `history_limit_bytes` bounds the primary history
+(default 1 MiB, maximum 8 MiB) and `truncated` reports a cut. While the
+alternate screen is active only that screen is captured.
+
+`terminal.output` carries raw PTY bytes as base64 with a per-attach `seq`. When
+a client falls behind, the server drops output and sends `terminal.gap`;
+request `terminal.snapshot` to resynchronize, which emits a fresh
+`terminal.snapshot` stamped with the current `seq`. `terminal.input` writes
+bytes to the PTY verbatim, including bracketed-paste wrappers and the mouse or
+focus reports the client's emulator produced. `terminal.detached` reports
+`takeover` or `closed`. The record shapes are in the bundled schema under
+`schemas.control_record`.
+
+`answer_queries` decides which emulator answers device attributes, XTGETTCAP,
+and OSC color queries. With `client` (the default) Herdr suppresses its own
+replies while the attach owns the terminal, so exactly one emulator answers;
+with `server` Herdr answers as usual.
+
+Sizes follow the tab layout by default: claim a tab with `tab.set_geometry` and
+Herdr lays the tab out in the claimed area. Every geometry change while a
+control stream is open, whichever client caused it, sends a `tab.layout` record
+on the stream before the terminals are resized. It carries the tab's
+`PaneLayoutSnapshot` with each pane's rectangle set to the inner area its
+terminal is sized to, after borders, gutters, and zoom. Because the record
+shares the ordered lane with `terminal.output`, a client always has the new
+rectangles before any redraw drawn at the new size. `session.snapshot` layouts
+use the server's shared view area and outer pane rectangles, so treat them as
+topology until the first `tab.layout` for a tab arrives. The claim follows the
+same rules as a Herdr client viewing the tab, so the last client to interact
+wins. An attach with `geometry: "terminal"` instead sizes one terminal with
+`terminal.resize` and locks the tab layout out of it; when it detaches, the
+tab's geometry controller sizes the terminal again.
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.

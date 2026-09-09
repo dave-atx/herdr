@@ -41,6 +41,7 @@ fn protocol_schema_document() -> serde_json::Value {
             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
             "event": protocol_schema_entry::<EventEnvelope>("event"),
             "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
+            "control_record": protocol_schema_entry::<ControlRecord>("control_record"),
         },
     })
 }
@@ -347,6 +348,67 @@ fn notification_show_sound_defaults_to_none() {
     };
 
     assert_eq!(params.sound, NotificationShowSound::None);
+}
+
+#[test]
+fn control_stream_requests_round_trip() {
+    let open = Request {
+        id: "c".into(),
+        method: Method::ControlOpen(ControlOpenParams::default()),
+    };
+    let json = serde_json::to_value(&open).unwrap();
+    assert_eq!(json["method"], "control.open");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), open);
+
+    let attach: Request = serde_json::from_str(
+        r#"{"id":"a","method":"terminal.attach","params":{"target":"w1:p1","takeover":true}}"#,
+    )
+    .unwrap();
+    let Method::TerminalAttach(params) = &attach.method else {
+        panic!("expected terminal.attach");
+    };
+    assert_eq!(params.mode, TerminalAttachMode::Raw);
+    assert_eq!(params.answer_queries, TerminalQueryAuthority::Client);
+    assert_eq!(params.geometry, TerminalAttachGeometry::Tab);
+    assert!(params.takeover);
+
+    let geometry = Request {
+        id: "g".into(),
+        method: Method::TabSetGeometry(TabSetGeometryParams {
+            tab_id: "w1:t1".into(),
+            cols: 120,
+            rows: 40,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        }),
+    };
+    let json = serde_json::to_value(&geometry).unwrap();
+    assert_eq!(json["method"], "tab.set_geometry");
+    assert_eq!(json["params"]["cols"], 120);
+}
+
+#[test]
+fn control_records_use_dotted_type_tags() {
+    let output = ControlRecord::Output {
+        attach_id: "1-0".into(),
+        seq: 7,
+        bytes: "aGk=".into(),
+    };
+    let json = serde_json::to_value(&output).unwrap();
+    assert_eq!(json["type"], "terminal.output");
+    assert_eq!(json["seq"], 7);
+    assert_eq!(
+        serde_json::from_value::<ControlRecord>(json).unwrap(),
+        output
+    );
+
+    let detached = ControlRecord::Detached {
+        attach_id: "1-0".into(),
+        reason: TerminalDetachReason::Takeover,
+    };
+    let json = serde_json::to_value(&detached).unwrap();
+    assert_eq!(json["type"], "terminal.detached");
+    assert_eq!(json["reason"], "takeover");
 }
 
 #[test]
@@ -727,6 +789,8 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                terminal_control_stream: 0,
+                server_pid: None,
             }),
         },
     };

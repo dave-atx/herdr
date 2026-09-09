@@ -644,6 +644,29 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
 
+## 控制流
+
+控制流是客户端保持打开的一条连接,用来像终端模拟器一样驱动 Herdr。它复用普通请求、事件订阅,以及客户端自行渲染的窗格的原始终端输出。支持它的服务器会在 `ping` 的 capabilities 中公布 `terminal_control_stream`(当前为 `1`),`herdr control` 会把一条控制流桥接到 stdin 和 stdout,因此无需 PTY 的 SSH exec 通道也能承载它。
+
+在新连接上把 `control.open` 作为第一个请求来打开控制流。响应报告服务器的 `boot_id`、`connection_id`、版本、协议和 capabilities。之后连接上的每一行都是请求;响应、推送的订阅事件和终端记录按同一顺序共享该套接字。`events.subscribe` 会把订阅加到同一连接上而不是接管它,`ping` 在本地应答。阻塞型辅助方法(`events.wait`、`agent.wait`、`agent.prompt`、`pane.wait_for_output`)和 `pane.graphics.stream` 会以 `unsupported_in_control_stream` 拒绝,请另开一条连接使用它们。`control.close` 或关闭连接会释放控制流拥有的一切。
+
+```json
+{"id":"c","method":"control.open","params":{}}
+{"id":"a","method":"terminal.attach","params":{"target":"w1:p1","answer_queries":"client","history_limit_bytes":1048576}}
+{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16}}
+{"id":"i","method":"terminal.input","params":{"attach_id":"1-0","bytes":"bHMK"}}
+{"id":"s","method":"terminal.snapshot","params":{"attach_id":"1-0"}}
+{"id":"d","method":"terminal.detach","params":{"attach_id":"1-0"}}
+```
+
+`terminal.attach` 接受窗格 ID、终端 ID 或代理名称,并像直接附加一样让控制流成为该终端的可写拥有者;传入 `takeover: true` 可驱逐其他拥有者。响应携带 `attach_id`,它的第一条记录是 `terminal.snapshot`:活动屏幕的 ANSI(带取消软换行回滚的 `primary`,或 `alternate`)、包含恢复终端状态所需序列(模式、滚动区域、制表位、字符集、当前画笔属性,以及包括已压入的 Kitty 栈在内的键盘协议)的 `state_ansi`、光标,以及以字段形式给出相同事实的 `state` 对象。PTY 读取中途截断的转义序列会紧随快照之后作为第一条 `terminal.output` 记录发送,因此客户端能够完整解析。快照在窗格的输出锁下获取,因此 `seq` 更大的每条 `terminal.output` 记录都产生于其后。`history_limit_bytes` 限制主屏幕历史(默认 1 MiB,最大 8 MiB),`truncated` 报告是否发生截断。备用屏幕处于活动状态时只捕获该屏幕。
+
+`terminal.output` 以 base64 携带原始 PTY 字节,并带有每个附加独立的 `seq`。客户端落后时,服务器会丢弃输出并发送 `terminal.gap`;请求 `terminal.snapshot` 重新同步,它会发出带当前 `seq` 的新 `terminal.snapshot`。`terminal.input` 把字节原样写入 PTY,包括括号粘贴包装以及客户端模拟器产生的鼠标或焦点报告。`terminal.detached` 报告 `takeover` 或 `closed`。记录结构在捆绑的 schema 的 `schemas.control_record` 下。
+
+`answer_queries` 决定由哪个模拟器应答设备属性、XTGETTCAP 和 OSC 颜色查询。使用 `client`(默认)时,在附加拥有终端期间 Herdr 会抑制自己的应答,因此恰好只有一个模拟器应答;使用 `server` 时 Herdr 照常应答。
+
+尺寸默认跟随标签页布局:用 `tab.set_geometry` 认领一个标签页,Herdr 会按认领的区域布局该标签页。控制流打开期间,无论由哪个客户端引起的几何变更,都会在终端调整尺寸之前向流发送一条 `tab.layout` 记录。它携带该标签页的 `PaneLayoutSnapshot`,其中每个窗格的矩形是应用边框、滚动槽和缩放之后终端实际被设置到的内部区域。由于该记录与 `terminal.output` 共享同一条有序通道,客户端总是在收到按新尺寸绘制的重绘之前拿到新矩形。`session.snapshot` 中的布局使用服务器的共享视图区域和窗格的外部矩形,因此在某个标签页的第一条 `tab.layout` 到达前,请只把它们当作拓扑信息。该认领遵循与查看该标签页的 Herdr 客户端相同的规则,因此最后交互的客户端获胜。使用 `geometry: "terminal"` 的附加则改为通过 `terminal.resize` 设置单个终端的尺寸,并把标签页布局排除在外;它分离后,标签页的几何控制器会重新为该终端设置尺寸。
+
 ## 读取窗格
 
 除非你在编写协议客户端,否则通过 CLI 使用 `pane.read`。

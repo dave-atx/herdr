@@ -1291,23 +1291,97 @@ impl Terminal {
     }
 
     fn format_keyboard_state_ansi(&self, kitty_keyboard: bool) -> Result<String, Error> {
+        self.format_state_ansi(ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            keyboard: true,
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                kitty_keyboard,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    /// Replayable VT for the state a raw attach must carry beyond modes:
+    /// scrolling regions, tab stops, charsets, and the pen (active SGR,
+    /// hyperlink, and protection). Keyboard protocols come from the pane's
+    /// tracker, which knows the pushed Kitty stack.
+    pub fn raw_attach_state_ansi(&self) -> Result<String, Error> {
+        self.format_state_only_ansi(ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            scrolling_region: true,
+            tabstops: true,
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                style: true,
+                hyperlink: true,
+                protection: true,
+                charsets: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    /// The formatter always emits content ahead of the extras, so format
+    /// one cell with and without them and keep only what the extras added.
+    fn format_state_only_ansi(
+        &self,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
+        let mut cell = ffi::GhosttyGridRef {
+            size: mem::size_of::<ffi::GhosttyGridRef>(),
+            ..Default::default()
+        };
+        unsafe {
+            ffi::ghostty_terminal_grid_ref(self.raw, ghostty_viewport_point(0, 0), &mut cell)
+                .into_result()?;
+        }
+        let selection = ffi::GhosttySelection {
+            size: mem::size_of::<ffi::GhosttySelection>(),
+            start: cell,
+            end: cell,
+            rectangle: false,
+        };
+        let with_state = self.format_terminal_vt(&selection, extra)?;
+        let content_only = self.format_terminal_vt(
+            &selection,
+            ffi::GhosttyFormatterTerminalExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+                screen: ffi::GhosttyFormatterScreenExtra {
+                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?;
+        Ok(with_state
+            .strip_prefix(content_only.as_str())
+            .map(str::to_owned)
+            .unwrap_or(with_state))
+    }
+
+    fn format_state_ansi(
+        &self,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
+        self.format_terminal_vt(ptr::null(), extra)
+    }
+
+    fn format_terminal_vt(
+        &self,
+        selection: *const ffi::GhosttySelection,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
         let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
         let options = ffi::GhosttyFormatterTerminalOptions {
             size: mem::size_of::<ffi::GhosttyFormatterTerminalOptions>(),
             emit: FormatterFormat::Vt.as_raw(),
             unwrap: false,
             trim: false,
-            extra: ffi::GhosttyFormatterTerminalExtra {
-                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
-                keyboard: true,
-                screen: ffi::GhosttyFormatterScreenExtra {
-                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
-                    kitty_keyboard,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            selection: ptr::null(),
+            extra,
+            selection,
         };
         unsafe {
             ffi::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.raw, options)
@@ -1458,6 +1532,16 @@ impl Terminal {
 
     pub fn cursor_y(&self) -> Result<u16, Error> {
         self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_Y)
+    }
+
+    /// Cursor column in the active area, independent of the viewport.
+    pub fn cursor_x(&self) -> Result<u16, Error> {
+        self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_X)
+    }
+
+    /// DECTCEM visibility of the active cursor, independent of the viewport.
+    pub fn cursor_visible(&self) -> Result<bool, Error> {
+        self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE)
     }
 
     pub fn effective_foreground_color(&self) -> Result<Option<RgbColor>, Error> {

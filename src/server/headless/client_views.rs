@@ -81,7 +81,7 @@ impl HeadlessServer {
             .or_else(|| self.default_shell_target())
     }
 
-    fn tab_id_for_target(&self, target: crate::ui::TabSurfaceTarget) -> Option<String> {
+    pub(super) fn tab_id_for_target(&self, target: crate::ui::TabSurfaceTarget) -> Option<String> {
         self.app
             .public_tab_id(target.workspace_index, target.tab_index)
     }
@@ -143,7 +143,12 @@ impl HeadlessServer {
                 .and_then(|target| self.tab_id_for_target(target));
         }
         let topology = self.client_shell_topology();
-        let live_clients = self.clients.keys().copied().collect::<HashSet<_>>();
+        let live_clients = self
+            .clients
+            .keys()
+            .copied()
+            .chain(self.control_connection_ids())
+            .collect::<HashSet<_>>();
         self.tab_geometry_controllers.retain(|tab_id, client_id| {
             topology.tab_workspace_ids.contains_key(tab_id) && live_clients.contains(client_id)
         });
@@ -512,7 +517,7 @@ impl HeadlessServer {
         }
     }
 
-    fn finish_shell_tab_geometry_change(&mut self, start_pending_agent_resumes: bool) {
+    pub(super) fn finish_shell_tab_geometry_change(&mut self, start_pending_agent_resumes: bool) {
         for client in self.clients.values_mut() {
             client.request_repaint();
         }
@@ -561,6 +566,22 @@ impl HeadlessServer {
         client_id: u64,
         target: crate::ui::TabSurfaceTarget,
     ) -> bool {
+        if let Some((cols, rows, cell_size)) =
+            self.control_tab_geometry_for_target(client_id, target)
+        {
+            let area = Rect::new(0, 0, cols, rows);
+            self.with_tab_layout_boundary(&[target], area, |server| {
+                crate::ui::compute_tab_surface_for(
+                    &server.app.state,
+                    &server.app.terminal_runtimes,
+                    Some(target),
+                    area,
+                    true,
+                    cell_size,
+                );
+            });
+            return true;
+        }
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
@@ -572,27 +593,30 @@ impl HeadlessServer {
         };
         let area = Rect::new(0, 0, cols, rows);
         if self.app_client_count() == 1 {
-            for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
-                for tab_index in 0..workspace.tabs.len() {
+            let targets = self.all_tab_targets();
+            self.with_tab_layout_boundary(&targets, area, |server| {
+                for target in &targets {
                     crate::ui::resize_tab_surface(
-                        &self.app.state,
-                        &self.app.terminal_runtimes,
-                        workspace_index,
-                        tab_index,
+                        &server.app.state,
+                        &server.app.terminal_runtimes,
+                        target.workspace_index,
+                        target.tab_index,
                         area,
                         cell_size,
                     );
                 }
-            }
+            });
         } else {
-            crate::ui::compute_tab_surface_for(
-                &self.app.state,
-                &self.app.terminal_runtimes,
-                Some(target),
-                area,
-                true,
-                cell_size,
-            );
+            self.with_tab_layout_boundary(&[target], area, |server| {
+                crate::ui::compute_tab_surface_for(
+                    &server.app.state,
+                    &server.app.terminal_runtimes,
+                    Some(target),
+                    area,
+                    true,
+                    cell_size,
+                );
+            });
         }
         if self
             .popup_owner_tab_id
@@ -613,7 +637,7 @@ impl HeadlessServer {
             .values()
             .filter(|client| client.is_active_shell_client() && client.writer.is_some())
             .count();
-        if active_shell_count != 1 {
+        if active_shell_count != 1 || self.control_connections_with_tab_claims() > 0 {
             return false;
         }
         let Some(client_id) = self.clients.iter().find_map(|(&client_id, client)| {
@@ -642,10 +666,13 @@ impl HeadlessServer {
             viewers.sort_unstable();
         }
         for (tab_id, viewers) in viewed_tabs {
-            let controller_is_viewing = self
-                .tab_geometry_controllers
-                .get(&tab_id)
-                .is_some_and(|controller| viewers.contains(controller));
+            let controller_is_viewing =
+                self.tab_geometry_controllers
+                    .get(&tab_id)
+                    .is_some_and(|controller| {
+                        viewers.contains(controller)
+                            || self.control_connection_holds_tab(*controller, &tab_id)
+                    });
             if !controller_is_viewing {
                 self.tab_geometry_controllers.insert(tab_id, viewers[0]);
             }

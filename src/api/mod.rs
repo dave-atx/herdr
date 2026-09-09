@@ -1,4 +1,5 @@
 pub mod client;
+pub mod control;
 mod event_hub;
 pub mod schema;
 mod server;
@@ -7,6 +8,7 @@ mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
+pub(crate) use server::default_capabilities as default_server_capabilities;
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};
 pub use status::{read_runtime_status_at, RuntimeStatus};
@@ -83,6 +85,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PluginPaneOpen(_)
             | Method::PluginPaneFocus(_)
             | Method::PluginPaneClose(_)
+            | Method::TabSetGeometry(_)
     )
 }
 
@@ -91,6 +94,8 @@ pub struct ApiRequestMessage {
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Set when the request arrived on a control stream.
+    pub control: Option<control::ControlConnectionHandle>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

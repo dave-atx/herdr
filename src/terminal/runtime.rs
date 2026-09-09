@@ -253,6 +253,10 @@ impl TerminalRuntime {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
 
+    pub(crate) fn hold_content_write_lock(&self) -> crate::pane::ContentWriteHold<'_> {
+        self.0.hold_content_write_lock()
+    }
+
     #[cfg(unix)]
     pub fn nudge_child_redraw_after_handoff(&self) {
         self.0.nudge_child_redraw_after_handoff();
@@ -451,6 +455,33 @@ impl TerminalRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes(bytes)
+    }
+
+    pub(crate) fn raw_input_sink(&self) -> crate::pane::raw_stream::RawInputSink {
+        self.0.raw_input_sink()
+    }
+
+    pub(crate) fn attach_raw(
+        &self,
+        attach_id: String,
+        outbound: crate::api::control::ControlOutboundSender,
+        budget: std::sync::Arc<crate::pane::raw_stream::RawTapBudget>,
+        suppress_terminal_responses: bool,
+    ) {
+        self.0
+            .attach_raw(attach_id, outbound, budget, suppress_terminal_responses)
+    }
+
+    pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
+        self.0.snapshot_raw(attach_id, history_limit_bytes)
+    }
+
+    pub(crate) fn detach_raw(
+        &self,
+        attach_id: &str,
+        reason: crate::api::schema::TerminalDetachReason,
+    ) -> bool {
+        self.0.detach_raw(attach_id, reason)
     }
 
     pub fn queue_user_input_submission(

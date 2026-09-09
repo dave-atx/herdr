@@ -2854,6 +2854,8 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                terminal_control_stream: 0,
+                server_pid: None,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2928,6 +2930,8 @@ mod tests {
                     ),
                     surface_interest: true,
                     health_check: true,
+                    terminal_control_stream: 0,
+                    server_pid: None,
                 }),
             },
         };
@@ -3186,6 +3190,8 @@ mod tests {
                     ),
                     surface_interest: true,
                     health_check: true,
+                    terminal_control_stream: 0,
+                    server_pid: None,
                 }),
             },
         };

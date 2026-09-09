@@ -2006,9 +2006,19 @@ impl App {
         ws_idx: usize,
         tab_idx: usize,
     ) -> Option<PaneLayoutSnapshot> {
+        self.pane_layout_snapshot_in_area(ws_idx, tab_idx, self.state.view.terminal_area)
+    }
+
+    /// Layout of one tab laid out in `area`, for clients whose tab size is
+    /// not the shared view area.
+    pub(crate) fn pane_layout_snapshot_in_area(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        area: ratatui::layout::Rect,
+    ) -> Option<PaneLayoutSnapshot> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
-        let area = self.state.view.terminal_area;
         let focused_pane_id = self.public_pane_id(ws_idx, tab.layout.focused())?;
         let panes = crate::ui::apply_pane_chrome(
             tab.layout.panes(area),
@@ -2060,6 +2070,30 @@ impl App {
         if let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) {
             self.emit_layout_updated_snapshot(layout);
         }
+    }
+
+    /// Layout for a control stream: the split structure from `area`, with
+    /// each pane's rectangle replaced by the inner rectangle its terminal is
+    /// sized to (borders, gutters, and zoom already applied).
+    pub(crate) fn control_tab_layout_snapshot(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        area: ratatui::layout::Rect,
+        pane_infos: &[crate::layout::PaneInfo],
+    ) -> Option<PaneLayoutSnapshot> {
+        let mut layout = self.pane_layout_snapshot_in_area(ws_idx, tab_idx, area)?;
+        layout.panes = pane_infos
+            .iter()
+            .filter_map(|info| {
+                Some(PaneLayoutPane {
+                    pane_id: self.public_pane_id(ws_idx, info.id)?,
+                    focused: info.is_focused,
+                    rect: info.inner_rect.into(),
+                })
+            })
+            .collect();
+        Some(layout)
     }
 
     pub(super) fn emit_layout_updated_snapshot(&mut self, layout: PaneLayoutSnapshot) {

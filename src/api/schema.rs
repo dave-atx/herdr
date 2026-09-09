@@ -11,6 +11,7 @@ pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod terminal;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -25,6 +26,7 @@ pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use terminal::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -264,6 +266,22 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    #[serde(rename = "control.open")]
+    ControlOpen(ControlOpenParams),
+    #[serde(rename = "control.close")]
+    ControlClose(EmptyParams),
+    #[serde(rename = "terminal.attach")]
+    TerminalAttach(TerminalAttachParams),
+    #[serde(rename = "terminal.detach")]
+    TerminalDetach(TerminalAttachTarget),
+    #[serde(rename = "terminal.input")]
+    TerminalInput(TerminalInputParams),
+    #[serde(rename = "terminal.snapshot")]
+    TerminalSnapshot(TerminalAttachTarget),
+    #[serde(rename = "terminal.resize")]
+    TerminalResize(TerminalResizeParams),
+    #[serde(rename = "tab.set_geometry")]
+    TabSetGeometry(TabSetGeometryParams),
 }
 
 #[cfg(test)]

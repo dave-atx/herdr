@@ -29,6 +29,7 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+pub(crate) mod raw_stream;
 mod state;
 mod terminal;
 mod xtgettcap;
@@ -40,6 +41,7 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+use self::raw_stream::{RawInputSink, RawTapBudget, RawTapRegistry};
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -1244,7 +1246,11 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
+    /// Set while `hold_content_write_lock` is live on the app thread.
+    content_lock_held: Cell<bool>,
     detection_content_seq: Arc<AtomicU64>,
+    /// Control-stream output taps; published under `content_write_lock`.
+    raw_taps: Arc<RawTapRegistry>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -1430,6 +1436,18 @@ pub enum WheelRouting {
     HostScroll,
     MouseReport,
     AlternateScroll,
+}
+
+/// A held content write lock; see `PaneRuntime::hold_content_write_lock`.
+pub(crate) struct ContentWriteHold<'a> {
+    runtime: &'a PaneRuntime,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for ContentWriteHold<'_> {
+    fn drop(&mut self) {
+        self.runtime.content_lock_held.set(false);
+    }
 }
 
 impl Drop for PaneRuntime {
@@ -2131,6 +2149,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let raw_taps = Arc::new(RawTapRegistry::default());
 
         let io = {
             let terminal = terminal.clone();
@@ -2140,6 +2159,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let raw_taps = raw_taps.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2155,6 +2175,15 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                raw_taps.note_read(bytes);
+                if raw_taps.has_taps() {
+                    raw_taps.publish(bytes);
+                }
+                let terminal_responses = if raw_taps.suppress_terminal_responses() {
+                    Vec::new()
+                } else {
+                    result.terminal_responses
+                };
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
@@ -2188,9 +2217,7 @@ impl PaneRuntime {
                         );
                     }
                 }
-                PtyReadResult {
-                    terminal_responses: result.terminal_responses,
-                }
+                PtyReadResult { terminal_responses }
             });
             let exit_events = events.clone();
             let on_reader_exit = Box::new(move || {
@@ -2232,7 +2259,9 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            content_lock_held: Cell::new(false),
             detection_content_seq,
+            raw_taps,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2292,6 +2321,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let raw_taps = Arc::new(RawTapRegistry::default());
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -2335,6 +2365,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let raw_taps = raw_taps.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2349,6 +2380,15 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                raw_taps.note_read(bytes);
+                if raw_taps.has_taps() {
+                    raw_taps.publish(bytes);
+                }
+                let terminal_responses = if raw_taps.suppress_terminal_responses() {
+                    Vec::new()
+                } else {
+                    result.terminal_responses
+                };
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
@@ -2384,9 +2424,7 @@ impl PaneRuntime {
                         );
                     }
                 }
-                PtyReadResult {
-                    terminal_responses: result.terminal_responses,
-                }
+                PtyReadResult { terminal_responses }
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),
@@ -2808,7 +2846,9 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            content_lock_held: Cell::new(false),
             detection_content_seq,
+            raw_taps,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2864,16 +2904,23 @@ impl PaneRuntime {
             return;
         }
         self.current_size.set(size);
-        let _content_write_guard = match self.content_write_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        let content_write_guard = if self.content_lock_held.get() {
+            None
+        } else {
+            Some(match self.content_write_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            })
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
-        let terminal_responses = self
-            .terminal
-            .resize(rows, cols, cell_width_px, cell_height_px);
+        let mut terminal_responses =
+            self.terminal
+                .resize(rows, cols, cell_width_px, cell_height_px);
+        if self.raw_taps.suppress_terminal_responses() {
+            terminal_responses.clear();
+        }
         self.content_seq.fetch_add(1, Ordering::Release);
-        drop(_content_write_guard);
+        drop(content_write_guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
         self.io.resize(
@@ -3134,6 +3181,85 @@ impl PaneRuntime {
         self.io.try_send_bytes(bytes)
     }
 
+    /// Input sink a control stream can write to without the app loop.
+    pub(crate) fn raw_input_sink(&self) -> RawInputSink {
+        match &self.io {
+            PaneRuntimeIo::Actor(actor) => RawInputSink::Actor(actor.clone()),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => RawInputSink::Channel(sender.clone()),
+        }
+    }
+
+    /// Register a raw output tap under the content write lock. Follow it
+    /// with `snapshot_raw`; the snapshot is taken under the same lock, so
+    /// every byte processed afterwards reaches the tap with a higher
+    /// sequence than the snapshot carries. Query suppression starts with
+    /// that snapshot, not here.
+    pub(crate) fn attach_raw(
+        &self,
+        attach_id: String,
+        outbound: crate::api::control::ControlOutboundSender,
+        budget: Arc<RawTapBudget>,
+        suppress_terminal_responses: bool,
+    ) {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps
+            .insert(attach_id, outbound, budget, suppress_terminal_responses);
+    }
+
+    /// Emit a snapshot on a live tap, ordered against output.
+    pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps.send_snapshot(attach_id, |seq| {
+            self.raw_snapshot_locked(seq, history_limit_bytes)
+        })
+    }
+
+    pub(crate) fn detach_raw(
+        &self,
+        attach_id: &str,
+        reason: crate::api::schema::TerminalDetachReason,
+    ) -> bool {
+        // Under the lock so a read in flight answers a query exactly once:
+        // either here or on the client, never neither.
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps.remove(attach_id, reason)
+    }
+
+    /// Holds the content write lock across a layout change so a
+    /// `tab.layout` record and the resizes behind it form one boundary
+    /// against PTY reads; `resize` reuses the held lock meanwhile.
+    pub(crate) fn hold_content_write_lock(&self) -> ContentWriteHold<'_> {
+        let guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.content_lock_held.set(true);
+        ContentWriteHold {
+            runtime: self,
+            _guard: guard,
+        }
+    }
+
+    fn raw_snapshot_locked(
+        &self,
+        seq: u64,
+        history_limit_bytes: usize,
+    ) -> Option<crate::api::schema::TerminalSnapshot> {
+        let cwd = self.cwd().map(|path| path.to_string_lossy().into_owned());
+        self.terminal
+            .raw_snapshot(seq, history_limit_bytes, self.terminal_title(), cwd)
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -3337,6 +3463,10 @@ impl PaneRuntime {
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
+        self.raw_taps.note_read(bytes);
+        if self.raw_taps.has_taps() {
+            self.raw_taps.publish(bytes);
+        }
         self.content_seq.fetch_add(1, Ordering::Release);
         self.compression.wake();
     }
@@ -3383,7 +3513,9 @@ impl PaneRuntime {
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
+                content_lock_held: Cell::new(false),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                raw_taps: Arc::new(RawTapRegistry::default()),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -3399,6 +3531,142 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_attach_orders_snapshot_before_output_and_suppresses_replies() {
+        use crate::api::control::ControlOutbound;
+        use crate::api::schema::TerminalDetachReason;
+
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hello\r\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw("1-0".into(), tx, Arc::new(RawTapBudget::new(1 << 20)), true);
+        // Output before the first snapshot never streams: the snapshot covers
+        // it, so the server still answers queries in that window.
+        assert!(!runtime.raw_taps.suppress_terminal_responses());
+        runtime.test_process_pty_bytes(b"early ");
+        assert!(rx.try_recv().is_err(), "unarmed tap must stay silent");
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.raw_taps.suppress_terminal_responses());
+
+        runtime.test_process_pty_bytes(b"world");
+        let records = rx.try_iter().collect::<Vec<_>>();
+        match &records[0] {
+            ControlOutbound::Snapshot { snapshot, .. } => {
+                assert_eq!(snapshot.seq, 0);
+                let primary = snapshot.primary.as_deref().unwrap_or_default();
+                assert!(primary.contains("hello"), "snapshot: {primary:?}");
+                assert!(primary.contains("early"), "snapshot: {primary:?}");
+                assert!(!primary.contains("world"));
+                assert_eq!(snapshot.state.cols, 20);
+                assert!(!snapshot.state_ansi.contains("2026"));
+                assert!(!snapshot.state_ansi.contains("1049"));
+                assert!(
+                    snapshot.state_ansi.contains("\x1b[?7h"),
+                    "autowrap replayed"
+                );
+                assert!(
+                    !snapshot.state_ansi.contains("hello"),
+                    "state carries no screen content: {:?}",
+                    snapshot.state_ansi
+                );
+            }
+            other => panic!("expected snapshot first, got {other:?}"),
+        }
+        match &records[1] {
+            ControlOutbound::Output { seq, bytes, .. } => {
+                assert_eq!(*seq, 1);
+                assert_eq!(&bytes[..], b"world");
+            }
+            other => panic!("expected output second, got {other:?}"),
+        }
+
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        match rx.try_recv() {
+            Ok(ControlOutbound::Snapshot { snapshot, .. }) => {
+                assert_eq!(snapshot.seq, 1);
+                assert!(snapshot
+                    .primary
+                    .as_deref()
+                    .is_some_and(|primary| primary.contains("world")));
+            }
+            other => panic!("expected a re-snapshot, got {other:?}"),
+        }
+
+        assert!(runtime.detach_raw("1-0", TerminalDetachReason::Closed));
+        assert!(!runtime.raw_taps.suppress_terminal_responses());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ControlOutbound::Detached {
+                reason: TerminalDetachReason::Closed,
+                ..
+            })
+        ));
+    }
+
+    /// A read that ends inside `ESC [` leaves the parser mid-sequence; the
+    /// snapshot replays those bytes so `6n` on the next read is a query on
+    /// the client too, which now owns the answer.
+    #[tokio::test]
+    async fn raw_snapshot_replays_a_split_escape_sequence() {
+        use crate::api::control::ControlOutbound;
+
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hi");
+        runtime.test_process_pty_bytes(b"\x1b[");
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw("1-0".into(), tx, Arc::new(RawTapBudget::new(1 << 20)), true);
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        runtime.test_process_pty_bytes(b"6n");
+
+        let records = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(records[0], ControlOutbound::Snapshot { .. }));
+        match (&records[1], &records[2]) {
+            (
+                ControlOutbound::Output { bytes: head, .. },
+                ControlOutbound::Output { bytes: tail, .. },
+            ) => {
+                assert_eq!(&head[..], b"\x1b[");
+                assert_eq!(&tail[..], b"6n");
+            }
+            other => panic!("expected the pending tail then the read, got {other:?}"),
+        }
+    }
+
+    /// A layout boundary holds the content lock across `resize`, which must
+    /// reuse it instead of blocking on itself.
+    #[tokio::test]
+    async fn resize_reuses_a_held_content_lock() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hello\r\n");
+        let hold = runtime.hold_content_write_lock();
+        runtime.resize(10, 40, 0, 0);
+        assert_eq!(runtime.current_size.get(), (10, 40, 0, 0));
+        assert!(
+            runtime.content_write_lock.try_lock().is_err(),
+            "the hold keeps the lock until it drops"
+        );
+        drop(hold);
+        assert!(runtime.content_write_lock.try_lock().is_ok());
+        runtime.resize(12, 50, 0, 0);
+        assert_eq!(runtime.current_size.get(), (12, 50, 0, 0));
+    }
+
+    #[test]
+    fn history_tail_truncation_cuts_on_a_line_boundary() {
+        let (kept, truncated) =
+            super::terminal::truncate_history_tail_for_test("one\ntwo\nthree\n".into(), 9);
+        assert!(truncated);
+        assert_eq!(kept, "three\n");
+        let (kept, truncated) = super::terminal::truncate_history_tail_for_test("ab".into(), 9);
+        assert!(!truncated);
+        assert_eq!(kept, "ab");
+        // A limit landing inside a multibyte character must not panic.
+        let (kept, truncated) =
+            super::terminal::truncate_history_tail_for_test("日本語\n語\n".into(), 5);
+        assert!(truncated);
+        assert_eq!(kept, "語\n");
+        let (kept, truncated) = super::terminal::truncate_history_tail_for_test("日本語".into(), 4);
+        assert!(truncated);
+        assert_eq!(kept, "語");
+    }
 
     #[test]
     fn pane_launch_env_removes_outer_codex_thread_id() {
@@ -4047,7 +4315,9 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            content_lock_held: Cell::new(false),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            raw_taps: Arc::new(RawTapRegistry::default()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -4084,7 +4354,9 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            content_lock_held: Cell::new(false),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            raw_taps: Arc::new(RawTapRegistry::default()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),

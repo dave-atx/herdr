@@ -510,6 +510,7 @@ fn stream_set_message(
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            control: None,
         },
         response_rx,
     )
@@ -575,6 +576,7 @@ fn direct_stream_message(
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            control: None,
         },
         response_rx,
     )
@@ -663,6 +665,7 @@ fn stream_open_gate_is_owned_by_the_layer_and_cancels_on_removal() {
         respond_to,
         response_write_complete: None,
         stream_active: Some(active.clone()),
+        control: None,
     });
     assert!(
         serde_json::from_str::<api::schema::SuccessResponse>(&response_rx.recv().unwrap()).is_ok()
@@ -772,6 +775,7 @@ fn stream_set_has_graphics_only_render_impact() {
         respond_to,
         response_write_complete: None,
         stream_active: None,
+        control: None,
     });
     assert_eq!(impact, RenderImpact::Full);
 }
@@ -807,6 +811,7 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
         respond_to,
         response_write_complete: None,
         stream_active: None,
+        control: None,
     });
     assert!(!changed);
     let response = response_rx
@@ -838,6 +843,7 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
         respond_to,
         response_write_complete: None,
         stream_active: None,
+        control: None,
     });
     assert_eq!(impact, RenderImpact::None);
     assert_eq!(

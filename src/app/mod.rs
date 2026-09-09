@@ -23,7 +23,7 @@ mod runtime;
 mod session;
 pub mod state;
 mod tab_bar_status;
-mod terminal_targets;
+pub(crate) mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
 mod window_title;

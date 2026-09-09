@@ -73,6 +73,7 @@ use crate::server::terminal_attach::paste_payload_for_runtime;
 
 mod bootstrap;
 mod client_views;
+mod control_stream;
 mod endpoint_requests;
 mod lifecycle;
 mod notifications;
@@ -228,8 +229,12 @@ pub struct HeadlessServer {
     server_config_diagnostic: Option<String>,
     /// Server config warning with keybinding diagnostics removed for local-keybinding clients.
     server_config_diagnostic_without_keybindings: Option<String>,
-    /// Writable direct attach owner per terminal id string.
+    /// Writable direct attach owner per terminal id string. Owners are client
+    /// ids or control connection ids.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Open control streams keyed by connection id.
+    control_connections: HashMap<u64, control_stream::ControlConnectionState>,
+    next_control_connection_id: u64,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -367,6 +372,8 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            control_connections: HashMap::new(),
+            next_control_connection_id: 1,
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -936,6 +943,7 @@ impl HeadlessServer {
             .values()
             .filter(|client| client.is_active_shell_client() && client.writer.is_some())
             .count()
+            + self.control_connections_with_tab_claims()
     }
 
     fn client_supports_direct_graphics(&self, client_id: u64) -> bool {
@@ -1837,13 +1845,20 @@ impl HeadlessServer {
                 return false;
             }
             if existing_owner != client_id {
-                self.send_to_client(
-                    existing_owner,
-                    ServerMessage::ServerShutdown {
-                        reason: Some("terminal attach taken over".to_owned()),
-                    },
-                );
-                self.remove_client_and_resize_if_needed(existing_owner);
+                if control_stream::is_control_connection_id(existing_owner) {
+                    self.detach_control_attaches_for_terminal(
+                        &terminal_id,
+                        api::schema::TerminalDetachReason::Takeover,
+                    );
+                } else {
+                    self.send_to_client(
+                        existing_owner,
+                        ServerMessage::ServerShutdown {
+                            reason: Some("terminal attach taken over".to_owned()),
+                        },
+                    );
+                    self.remove_client_and_resize_if_needed(existing_owner);
+                }
             }
         }
 
@@ -2911,6 +2926,12 @@ impl HeadlessServer {
             });
             let _ = msg.respond_to.send(response);
             return false;
+        }
+
+        if let Some(response) = self.handle_control_api_request(&msg) {
+            let changed = api::request_changes_ui(&msg.request);
+            let _ = msg.respond_to.send(response);
+            return changed;
         }
 
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {

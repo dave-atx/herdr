@@ -519,21 +519,22 @@ impl ReadWait {
     }
 }
 
+/// Read polling for streams whose transport has no receive timeout.
 #[derive(Clone, Copy)]
-struct PollBackoff {
-    interval: Duration,
+pub(super) struct PollBackoff {
+    pub(super) interval: Duration,
     fast_polls_remaining: u8,
 }
 
 impl PollBackoff {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             interval: STREAM_FALLBACK_POLL_INTERVAL,
             fast_polls_remaining: STREAM_FALLBACK_FAST_POLLS,
         }
     }
 
-    fn advance(&mut self) {
+    pub(super) fn advance(&mut self) {
         if self.fast_polls_remaining > 0 {
             self.fast_polls_remaining -= 1;
             return;
@@ -541,7 +542,7 @@ impl PollBackoff {
         self.interval = (self.interval * 2).min(CONNECTION_POLL_INTERVAL);
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         *self = Self::new();
     }
 }

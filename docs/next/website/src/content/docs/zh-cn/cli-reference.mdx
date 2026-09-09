@@ -329,10 +329,12 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 herdr terminal attach <terminal_id> [--takeover]
 herdr terminal title set <title>
 herdr terminal title clear
+herdr [--session <name>] control
 ```
 
 从直接附加中用 `ctrl+b q` 分离。用 `ctrl+b ctrl+b` 发送字面的 `ctrl+b`。
 `terminal title clear` 把外层终端窗口标题交还给 `ui.window_title`。
+`control` 打开一条套接字 API 控制流,并以换行分隔的 JSON 桥接到 stdin 和 stdout。打印的第一行是带服务器 boot id 和 capabilities 的 `control.open` 响应;写入 stdin 的请求会在 stdout 上得到响应、订阅事件和原始 `terminal.*` 记录。它面向在 SSH exec 通道上用自己的终端模拟器渲染窗格的客户端,`terminal.attach` 系列方法见套接字 API 文档。stdin 的 EOF 会关闭控制流。
 
 ## 输出等待
 

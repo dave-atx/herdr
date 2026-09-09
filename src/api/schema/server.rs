@@ -27,4 +27,10 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    /// Control stream protocol supported by this server; 0 when unsupported.
+    #[serde(default)]
+    pub terminal_control_stream: u32,
+    /// Process id of the server, for clients that key state on a server instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_pid: Option<u32>,
 }

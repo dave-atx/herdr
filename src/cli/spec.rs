@@ -36,6 +36,7 @@ pub(super) fn command() -> Command {
         .subcommand(machine::command())
         .subcommand(server_command())
         .subcommand(api_command())
+        .subcommand(control_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
@@ -186,6 +187,10 @@ fn api_command() -> Command {
                 .arg(json_flag())
                 .arg(path_option("output", "PATH")),
         )
+}
+
+fn control_command() -> Command {
+    Command::new("control").about("Bridge a socket API control stream to stdin and stdout")
 }
 
 fn workspace_command() -> Command {
