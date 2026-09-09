@@ -870,7 +870,11 @@ and the first record for it is `terminal.snapshot`: the active screen as ANSI
 (`primary` with unwrapped scrollback, or `alternate`), `state_ansi` with the
 sequences that restore terminal state (modes, scrolling region, tab stops,
 charsets, the active pen, and the keyboard protocols including the pushed
-Kitty stack), the cursor, and a `state` object with the same facts as fields.
+Kitty stack), `pen_ansi` with the active pen alone, the cursor, and a `state`
+object with the same facts as fields. A cursor that sits on the last column
+after a print reports `pending_wrap` with `pending_wrap_cell`, the styled cell
+to reprint from that position so the client's terminal wraps the next
+character the way the server's does.
 Any escape sequence a PTY read left unfinished follows the snapshot as the
 first `terminal.output` record, so the client parses it whole. The snapshot is taken under
 the pane's output lock, so every `terminal.output` record with a higher `seq`
@@ -893,7 +897,10 @@ replies while the attach owns the terminal, so exactly one emulator answers;
 with `server` Herdr answers as usual.
 
 Sizes follow the tab layout by default: claim a tab with `tab.set_geometry` and
-Herdr lays the tab out in the claimed area. Every geometry change while a
+Herdr lays the tab out in the claimed area. Pass `chrome: "none"` to lay the
+tab out without Herdr's borders, gaps, and scrollbar gutters, so the pane
+rectangles tile the area exactly and the client draws its own dividers; the
+default `server` keeps the configured chrome. Every geometry change while a
 control stream is open, whichever client caused it, sends a `tab.layout` record
 on the stream before the terminals are resized. It carries the tab's
 `PaneLayoutSnapshot` with each pane's rectangle set to the inner area its

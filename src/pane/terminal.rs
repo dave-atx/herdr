@@ -41,9 +41,13 @@ use super::{
 const DEFAULT_DETECTION_ROWS: usize = 24;
 const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
+/// ANSI insert mode (IRM); bit 15 marks a mode as ANSI rather than DEC
+/// private in libghostty's packed mode id.
+const MODE_INSERT: u16 = 4 | 0x8000;
 const MODE_ORIGIN: u16 = 6;
 const MODE_AUTOWRAP: u16 = 7;
 const MODE_MOUSE_X10: u16 = 9;
+const MODE_LEFT_RIGHT_MARGIN: u16 = 69;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
 const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
 const MODE_MOUSE_ANY_MOTION: u16 = 1003;
@@ -1809,6 +1813,12 @@ impl GhosttyPaneTerminal {
             visible: core.terminal.cursor_visible().unwrap_or(true),
             shape,
         };
+        // A cursor-position command clears the pending wrap, so the client
+        // reprints the cell under the cursor to set it again.
+        let pending_wrap = core.terminal.cursor_pending_wrap().unwrap_or(false);
+        let pending_wrap_cell = pending_wrap
+            .then(|| pending_wrap_cell_ansi(&core.terminal, cursor.x, cursor.y))
+            .flatten();
 
         let terminal = &core.terminal;
         let mode = |mode: u16| terminal.mode_get(mode).unwrap_or(false);
@@ -1835,6 +1845,9 @@ impl GhosttyPaneTerminal {
             ),
             (MODE_ORIGIN, mode(MODE_ORIGIN)),
             (MODE_AUTOWRAP, mode(MODE_AUTOWRAP)),
+            // Ahead of the formatter's DECSLRM: margins are ignored while
+            // the mode is off.
+            (MODE_LEFT_RIGHT_MARGIN, mode(MODE_LEFT_RIGHT_MARGIN)),
             (MODE_MOUSE_X10, mode(MODE_MOUSE_X10)),
             (MODE_MOUSE_PRESS_RELEASE, mode(MODE_MOUSE_PRESS_RELEASE)),
             (MODE_MOUSE_BUTTON_MOTION, mode(MODE_MOUSE_BUTTON_MOTION)),
@@ -1868,6 +1881,12 @@ impl GhosttyPaneTerminal {
                 if enabled { 'h' } else { 'l' }
             ));
         }
+        // Insert mode is an ANSI mode, so no `?`.
+        state_ansi.push_str(if mode(MODE_INSERT) {
+            "\x1b[4h"
+        } else {
+            "\x1b[4l"
+        });
         if let Ok(extra) = terminal.raw_attach_state_ansi() {
             state_ansi.push_str(&extra);
         }
@@ -1884,6 +1903,7 @@ impl GhosttyPaneTerminal {
         if cursor.shape > 0 {
             state_ansi.push_str(&format!("\x1b[{} q", cursor.shape));
         }
+        let pen_ansi = terminal.pen_ansi().unwrap_or_default();
 
         let scroll = terminal.scrollbar().ok().map(|scrollbar| PaneScrollInfo {
             offset_from_bottom: scrollbar
@@ -1900,11 +1920,14 @@ impl GhosttyPaneTerminal {
             primary,
             alternate,
             state_ansi,
+            pen_ansi,
             cursor: TerminalCursorInfo {
                 x: cursor.x,
                 y: cursor.y,
                 visible: cursor.visible,
                 shape: cursor.shape,
+                pending_wrap,
+                pending_wrap_cell,
             },
             state: TerminalStateInfo {
                 cols,
@@ -2954,6 +2977,25 @@ fn ghostty_recent_ansi(
 #[cfg(test)]
 pub(super) fn truncate_history_tail_for_test(text: String, limit: usize) -> (String, bool) {
     truncate_history_tail(text, limit)
+}
+
+/// The cell under a pending-wrap cursor as styled VT the client prints from
+/// that position. The cursor rests on a wide glyph's spacer tail, so the
+/// glyph is printed from one column left, with a cursor-left ahead of it.
+fn pending_wrap_cell_ansi(terminal: &crate::ghostty::Terminal, x: u16, y: u16) -> Option<String> {
+    let start = match terminal.cell_wide(x, y).ok()? {
+        crate::ghostty::CellWide::SpacerTail => x.checked_sub(1)?,
+        _ => x,
+    };
+    let cell = terminal.cell_ansi(start, x, y).ok()?;
+    if cell.is_empty() {
+        return None;
+    }
+    Some(if start < x {
+        format!("\x1b[D{cell}")
+    } else {
+        cell
+    })
 }
 
 /// Keep at most `limit` trailing bytes of history, cut on a line boundary
@@ -5049,7 +5091,12 @@ mod tests {
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
-        pane.process_pty_bytes(pane_id, 0, b"SECRET-CONTENT\x1b[>1u\x1b[>5u\x1b[3;10r", &tx);
+        pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"SECRET-CONTENT\x1b[>1u\x1b[>5u\x1b[3;10r\x1b[4h\x1b[?69h\x1b[5;60s",
+            &tx,
+        );
 
         let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
         assert!(
@@ -5057,6 +5104,22 @@ mod tests {
             "state: {:?}",
             snapshot.state_ansi
         );
+        // Insert mode and the margin mode come back, the mode ahead of the
+        // DECSLRM it gates.
+        assert!(
+            snapshot.state_ansi.contains("\x1b[4h"),
+            "state: {:?}",
+            snapshot.state_ansi
+        );
+        let lrmm = snapshot
+            .state_ansi
+            .find("\x1b[?69h")
+            .expect("mode 69 restored");
+        let slrm = snapshot
+            .state_ansi
+            .find("\x1b[5;60s")
+            .expect("DECSLRM restored");
+        assert!(lrmm < slrm, "state: {:?}", snapshot.state_ansi);
         assert!(snapshot.state_ansi.contains("\x1b[>1u\x1b[>5u"));
         assert!(snapshot.state_ansi.contains("\x1b[3;10r"));
         // Cursor sits after the text; the scrolling region moved it home.
@@ -5104,6 +5167,88 @@ mod tests {
         assert_eq!(snapshot.cursor.x, 1);
         assert_eq!(snapshot.cursor.y, 3);
         assert!(!snapshot.cursor.visible);
+        assert!(!snapshot.cursor.pending_wrap);
+        assert!(snapshot.cursor.pending_wrap_cell.is_none());
+        assert!(
+            snapshot.pen_ansi.contains("\x1b[31m") || snapshot.pen_ansi.contains("\x1b[38;5;1m"),
+            "pen: {:?}",
+            snapshot.pen_ansi
+        );
+        assert!(!snapshot.pen_ansi.contains("line"));
+    }
+
+    /// Output that stops on the last column leaves the terminal about to
+    /// wrap. The client's cursor-position command clears that, so the
+    /// snapshot hands it the cell to reprint; the cursor stays put and the
+    /// next printable lands on the following row.
+    #[test]
+    fn raw_snapshot_carries_the_pending_wrap_cell() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"abcdefghi\x1b[32mJ", &tx);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(snapshot.cursor.pending_wrap);
+        assert_eq!((snapshot.cursor.x, snapshot.cursor.y), (9, 0));
+        let cell = snapshot.cursor.pending_wrap_cell.clone().unwrap();
+        assert!(
+            cell.ends_with('J') || cell.contains("J\x1b["),
+            "cell: {cell:?}"
+        );
+
+        // Replay the way a client does: home, print the cell, then continue.
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = Vec::new();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(b"\x1b[1;10H\x1b[0m");
+        replay.extend_from_slice(cell.as_bytes());
+        replay.extend_from_slice(b"\x1b[0m");
+        replay.extend_from_slice(snapshot.pen_ansi.as_bytes());
+        replay.extend_from_slice(b"K");
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.cursor_y().unwrap(), 1);
+        assert_eq!(core.terminal.cursor_x().unwrap(), 1);
+        let row0 = core.terminal.cell_ansi(0, 9, 0).unwrap();
+        assert!(row0.contains("abcdefghi"), "row0: {row0:?}");
+        assert!(row0.contains('J'), "row0: {row0:?}");
+    }
+
+    /// A wide glyph on the last two columns puts the cursor on its spacer
+    /// tail; the snapshot reprints the whole glyph from one column left.
+    #[test]
+    fn raw_snapshot_pending_wrap_cell_covers_a_wide_glyph() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, "abcdefgh漢".as_bytes(), &tx);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(snapshot.cursor.pending_wrap);
+        assert_eq!(snapshot.cursor.x, 9);
+        let cell = snapshot.cursor.pending_wrap_cell.unwrap();
+        assert!(cell.starts_with("\x1b[D"), "cell: {cell:?}");
+        assert!(cell.contains('漢'), "cell: {cell:?}");
+
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = Vec::new();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(b"\x1b[1;10H\x1b[0m");
+        replay.extend_from_slice(cell.as_bytes());
+        replay.extend_from_slice(b"\x1b[0mK");
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.cursor_y().unwrap(), 1);
+        assert_eq!(core.terminal.cursor_x().unwrap(), 1);
+        let row0 = core.terminal.cell_ansi(0, 9, 0).unwrap();
+        assert!(row0.contains("abcdefgh漢"), "row0: {row0:?}");
     }
 
     #[cfg(windows)]

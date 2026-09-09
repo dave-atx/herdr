@@ -158,6 +158,18 @@
         },
         "TerminalCursorInfo": {
           "properties": {
+            "pending_wrap": {
+              "default": false,
+              "description": "The next printable wraps to the next row: the cursor sits on the\nlast column after a print. A client's cursor-position command\nclears that, so it has to be re-established.",
+              "type": "boolean"
+            },
+            "pending_wrap_cell": {
+              "description": "The cell under the cursor as styled VT, present with `pending_wrap`,\nso reprinting it sets the flag again without changing the screen.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "shape": {
               "description": "DECSCUSR parameter (0 to 6).",
               "format": "uint8",
@@ -218,6 +230,11 @@
             },
             "cursor": {
               "$ref": "#/schemas/control_record/$defs/TerminalCursorInfo"
+            },
+            "pen_ansi": {
+              "default": "",
+              "description": "The active pen alone (SGR, hyperlink, protection), for restoring\nit after the client prints anything of its own.",
+              "type": "string"
             },
             "primary": {
               "description": "Primary screen scrollback plus screen as unwrapped ANSI. Absent when\nthe alternate screen is active, because only the active screen can\nbe read.",
@@ -4799,6 +4816,21 @@
             }
           ]
         },
+        "TabChrome": {
+          "description": "Layout chrome for a tab a control stream sizes.",
+          "oneOf": [
+            {
+              "const": "server",
+              "description": "Borders, gaps, and scrollbar gutters follow the server's config.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Panes tile the area exactly; the client draws its own dividers.",
+              "type": "string"
+            }
+          ]
+        },
         "TabCreateParams": {
           "properties": {
             "cwd": {
@@ -4888,6 +4920,11 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "chrome": {
+              "$ref": "#/schemas/request/$defs/TabChrome",
+              "default": "server",
+              "description": "Whether Herdr lays the tab out with its own borders, gaps, and\nscrollbar gutters, or hands the client bare pane rectangles."
             },
             "cols": {
               "format": "uint16",

@@ -674,6 +674,7 @@ impl HeadlessServer {
                             || self.control_connection_holds_tab(*controller, &tab_id)
                     });
             if !controller_is_viewing {
+                self.note_tab_geometry_owner(&tab_id, viewers[0]);
                 self.tab_geometry_controllers.insert(tab_id, viewers[0]);
             }
         }
@@ -726,6 +727,7 @@ impl HeadlessServer {
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };
+        self.note_tab_geometry_owner(&tab_id, client_id);
         if self.tab_geometry_controllers.insert(tab_id, client_id) == Some(client_id) {
             return false;
         }
@@ -750,8 +752,18 @@ impl HeadlessServer {
         if self.tab_geometry_controllers.contains_key(&tab_id) {
             return false;
         }
+        self.note_tab_geometry_owner(&tab_id, client_id);
         self.tab_geometry_controllers.insert(tab_id, client_id);
         self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
+    }
+
+    /// Chrome follows the geometry owner: a regular client taking a tab
+    /// gets the configured borders and gutters back, whatever a control
+    /// stream had asked for.
+    fn note_tab_geometry_owner(&mut self, tab_id: &str, client_id: u64) {
+        if !super::control_stream::is_control_connection_id(client_id) {
+            self.app.state.control_chromeless_tabs.remove(tab_id);
+        }
     }
 
     pub(super) fn resize_shell_tab_if_controller(

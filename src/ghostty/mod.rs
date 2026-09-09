@@ -1544,6 +1544,56 @@ impl Terminal {
         self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE)
     }
 
+    /// Whether the next printable soft-wraps: the last print landed on the
+    /// final column.
+    pub fn cursor_pending_wrap(&self) -> Result<bool, Error> {
+        self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_PENDING_WRAP)
+    }
+
+    /// Active-area cells `start_x..=end_x` on one row as styled VT.
+    pub fn cell_ansi(&self, start_x: u16, end_x: u16, y: u16) -> Result<String, Error> {
+        self.read_formatted_selection(
+            ghostty_active_point(start_x, u32::from(y)),
+            ghostty_active_point(end_x, u32::from(y)),
+            false,
+            FormatterFormat::Vt,
+            false,
+            false,
+        )
+    }
+
+    /// The wide property of one active-area cell.
+    pub fn cell_wide(&self, x: u16, y: u16) -> Result<CellWide, Error> {
+        let mut cell = ffi::GhosttyGridRef {
+            size: mem::size_of::<ffi::GhosttyGridRef>(),
+            ..Default::default()
+        };
+        unsafe {
+            ffi::ghostty_terminal_grid_ref(
+                self.raw,
+                ghostty_active_point(x, u32::from(y)),
+                &mut cell,
+            )
+            .into_result()?;
+        }
+        grid_ref_wide(&cell)
+    }
+
+    /// The pen alone: SGR, hyperlink, and protection state.
+    pub fn pen_ansi(&self) -> Result<String, Error> {
+        self.format_state_only_ansi(ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                style: true,
+                hyperlink: true,
+                protection: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
     pub fn effective_foreground_color(&self) -> Result<Option<RgbColor>, Error> {
         self.get_optional_rgb_color(TERMINAL_DATA_COLOR_FOREGROUND)
     }
@@ -2025,6 +2075,15 @@ impl Drop for Terminal {
             ffi::ghostty_tracked_grid_ref_free(self.tracked_row);
             ffi::ghostty_terminal_free(self.raw);
         }
+    }
+}
+
+fn ghostty_active_point(x: u16, y: u32) -> ffi::GhosttyPoint {
+    ffi::GhosttyPoint {
+        tag: ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+        value: ffi::GhosttyPointValue {
+            coordinate: ffi::GhosttyPointCoordinate { x, y },
+        },
     }
 }
 

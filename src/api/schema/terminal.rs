@@ -105,6 +105,23 @@ pub struct TabSetGeometryParams {
     pub cell_width_px: u32,
     #[serde(default)]
     pub cell_height_px: u32,
+    /// Whether Herdr lays the tab out with its own borders, gaps, and
+    /// scrollbar gutters, or hands the client bare pane rectangles.
+    #[serde(default)]
+    pub chrome: TabChrome,
+}
+
+/// Layout chrome for a tab a control stream sizes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TabChrome {
+    /// Borders, gaps, and scrollbar gutters follow the server's config.
+    #[default]
+    Server,
+    /// Panes tile the area exactly; the client draws its own dividers.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -114,13 +131,22 @@ pub enum TerminalScreenKind {
     Alternate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TerminalCursorInfo {
     pub x: u16,
     pub y: u16,
     pub visible: bool,
     /// DECSCUSR parameter (0 to 6).
     pub shape: u8,
+    /// The next printable wraps to the next row: the cursor sits on the
+    /// last column after a print. A client's cursor-position command
+    /// clears that, so it has to be re-established.
+    #[serde(default)]
+    pub pending_wrap: bool,
+    /// The cell under the cursor as styled VT, present with `pending_wrap`,
+    /// so reprinting it sets the flag again without changing the screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_wrap_cell: Option<String>,
 }
 
 /// Terminal facts captured with the snapshot. Everything here is also
@@ -165,6 +191,10 @@ pub struct TerminalSnapshot {
     pub alternate: Option<String>,
     /// Mode and keyboard-protocol sequences that restore terminal state.
     pub state_ansi: String,
+    /// The active pen alone (SGR, hyperlink, protection), for restoring
+    /// it after the client prints anything of its own.
+    #[serde(default)]
+    pub pen_ansi: String,
     pub cursor: TerminalCursorInfo,
     pub state: TerminalStateInfo,
     /// True when `history_limit_bytes` cut older history.

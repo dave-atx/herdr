@@ -199,8 +199,19 @@ impl HeadlessServer {
                 TerminalDetachReason::Closed,
             );
         }
+        // Only claims this connection still holds: another stream may have
+        // taken a tab over since, and its chrome choice stays in force.
+        let owned = state
+            .tab_geometry
+            .keys()
+            .filter(|tab_id| self.tab_geometry_controllers.get(*tab_id) == Some(&connection_id))
+            .cloned()
+            .collect::<Vec<_>>();
         self.tab_geometry_controllers
             .retain(|_, controller| *controller != connection_id);
+        for tab_id in owned {
+            self.app.state.control_chromeless_tabs.remove(&tab_id);
+        }
         // Always re-derive geometry: terminal-sized attaches released above
         // need their tabs back even when this stream held no tab claims.
         if !self.resize_tabs_for_only_shell_client(true) {
@@ -612,6 +623,20 @@ impl HeadlessServer {
             .insert(params.tab_id.clone(), (params.cols, params.rows, cell_size));
         self.tab_geometry_controllers
             .insert(params.tab_id.clone(), connection_id);
+        match params.chrome {
+            api::schema::TabChrome::None => {
+                self.app
+                    .state
+                    .control_chromeless_tabs
+                    .insert(params.tab_id.clone());
+            }
+            api::schema::TabChrome::Server => {
+                self.app
+                    .state
+                    .control_chromeless_tabs
+                    .remove(&params.tab_id);
+            }
+        }
         self.apply_control_tab_geometry(
             crate::ui::TabSurfaceTarget {
                 workspace_index,

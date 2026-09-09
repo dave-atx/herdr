@@ -2,7 +2,7 @@ use super::*;
 
 use crate::api::control::{ControlConnectionHandle, ControlOutbound};
 use crate::api::schema::{
-    Method, Request, TabSetGeometryParams, TerminalAttachGeometry, TerminalAttachMode,
+    Method, Request, TabChrome, TabSetGeometryParams, TerminalAttachGeometry, TerminalAttachMode,
     TerminalAttachParams, TerminalAttachTarget, TerminalDetachReason, TerminalQueryAuthority,
 };
 
@@ -166,9 +166,14 @@ async fn control_stream_attaches_streams_and_releases_on_close() {
             rows: 40,
             cell_width_px: 8,
             cell_height_px: 16,
+            chrome: TabChrome::None,
         }),
     )
     .expect("geometry response");
+    assert!(
+        server.app.state.control_chromeless_tabs.contains(&tab_id),
+        "chrome: none marks the tab chromeless"
+    );
     assert_eq!(
         resized["result"]["type"], "ok",
         "geometry failed: {resized}"
@@ -195,6 +200,8 @@ async fn control_stream_attaches_streams_and_releases_on_close() {
     let (rows, cols) = runtime.current_size();
     assert_eq!(layout["layout"]["panes"][0]["rect"]["width"], cols);
     assert_eq!(layout["layout"]["panes"][0]["rect"]["height"], rows);
+    // Chromeless: no scrollbar gutter or border shaved off the pane.
+    assert_eq!((rows, cols), (40, 120));
 
     let snapshot_again = send_control(
         &mut server,

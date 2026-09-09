@@ -380,11 +380,21 @@ fn control_stream_requests_round_trip() {
             rows: 40,
             cell_width_px: 8,
             cell_height_px: 16,
+            chrome: TabChrome::None,
         }),
     };
     let json = serde_json::to_value(&geometry).unwrap();
     assert_eq!(json["method"], "tab.set_geometry");
     assert_eq!(json["params"]["cols"], 120);
+    assert_eq!(json["params"]["chrome"], "none");
+    let bare: Request = serde_json::from_str(
+        r#"{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40}}"#,
+    )
+    .unwrap();
+    let Method::TabSetGeometry(params) = bare.method else {
+        panic!("expected tab.set_geometry");
+    };
+    assert_eq!(params.chrome, TabChrome::Server);
 }
 
 #[test]

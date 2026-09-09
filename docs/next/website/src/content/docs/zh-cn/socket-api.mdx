@@ -659,13 +659,13 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 {"id":"d","method":"terminal.detach","params":{"attach_id":"1-0"}}
 ```
 
-`terminal.attach` 接受窗格 ID、终端 ID 或代理名称,并像直接附加一样让控制流成为该终端的可写拥有者;传入 `takeover: true` 可驱逐其他拥有者。响应携带 `attach_id`,它的第一条记录是 `terminal.snapshot`:活动屏幕的 ANSI(带取消软换行回滚的 `primary`,或 `alternate`)、包含恢复终端状态所需序列(模式、滚动区域、制表位、字符集、当前画笔属性,以及包括已压入的 Kitty 栈在内的键盘协议)的 `state_ansi`、光标,以及以字段形式给出相同事实的 `state` 对象。PTY 读取中途截断的转义序列会紧随快照之后作为第一条 `terminal.output` 记录发送,因此客户端能够完整解析。快照在窗格的输出锁下获取,因此 `seq` 更大的每条 `terminal.output` 记录都产生于其后。`history_limit_bytes` 限制主屏幕历史(默认 1 MiB,最大 8 MiB),`truncated` 报告是否发生截断。备用屏幕处于活动状态时只捕获该屏幕。
+`terminal.attach` 接受窗格 ID、终端 ID 或代理名称,并像直接附加一样让控制流成为该终端的可写拥有者;传入 `takeover: true` 可驱逐其他拥有者。响应携带 `attach_id`,它的第一条记录是 `terminal.snapshot`:活动屏幕的 ANSI(带取消软换行回滚的 `primary`,或 `alternate`)、包含恢复终端状态所需序列(模式、滚动区域、制表位、字符集、当前画笔属性,以及包括已压入的 Kitty 栈在内的键盘协议)的 `state_ansi`、仅包含当前画笔属性的 `pen_ansi`、光标,以及以字段形式给出相同事实的 `state` 对象。打印后停留在最后一列的光标会报告 `pending_wrap` 和 `pending_wrap_cell`,后者是要从该位置重新打印的带样式单元格,使客户端终端像服务器一样换行下一个字符。PTY 读取中途截断的转义序列会紧随快照之后作为第一条 `terminal.output` 记录发送,因此客户端能够完整解析。快照在窗格的输出锁下获取,因此 `seq` 更大的每条 `terminal.output` 记录都产生于其后。`history_limit_bytes` 限制主屏幕历史(默认 1 MiB,最大 8 MiB),`truncated` 报告是否发生截断。备用屏幕处于活动状态时只捕获该屏幕。
 
 `terminal.output` 以 base64 携带原始 PTY 字节,并带有每个附加独立的 `seq`。客户端落后时,服务器会丢弃输出并发送 `terminal.gap`;请求 `terminal.snapshot` 重新同步,它会发出带当前 `seq` 的新 `terminal.snapshot`。`terminal.input` 把字节原样写入 PTY,包括括号粘贴包装以及客户端模拟器产生的鼠标或焦点报告。`terminal.detached` 报告 `takeover` 或 `closed`。记录结构在捆绑的 schema 的 `schemas.control_record` 下。
 
 `answer_queries` 决定由哪个模拟器应答设备属性、XTGETTCAP 和 OSC 颜色查询。使用 `client`(默认)时,在附加拥有终端期间 Herdr 会抑制自己的应答,因此恰好只有一个模拟器应答;使用 `server` 时 Herdr 照常应答。
 
-尺寸默认跟随标签页布局:用 `tab.set_geometry` 认领一个标签页,Herdr 会按认领的区域布局该标签页。控制流打开期间,无论由哪个客户端引起的几何变更,都会在终端调整尺寸之前向流发送一条 `tab.layout` 记录。它携带该标签页的 `PaneLayoutSnapshot`,其中每个窗格的矩形是应用边框、滚动槽和缩放之后终端实际被设置到的内部区域。由于该记录与 `terminal.output` 共享同一条有序通道,客户端总是在收到按新尺寸绘制的重绘之前拿到新矩形。`session.snapshot` 中的布局使用服务器的共享视图区域和窗格的外部矩形,因此在某个标签页的第一条 `tab.layout` 到达前,请只把它们当作拓扑信息。该认领遵循与查看该标签页的 Herdr 客户端相同的规则,因此最后交互的客户端获胜。使用 `geometry: "terminal"` 的附加则改为通过 `terminal.resize` 设置单个终端的尺寸,并把标签页布局排除在外;它分离后,标签页的几何控制器会重新为该终端设置尺寸。
+尺寸默认跟随标签页布局:用 `tab.set_geometry` 认领一个标签页,Herdr 会按认领的区域布局该标签页。传入 `chrome: "none"` 可让 Herdr 在布局时不带自身的边框、间隙和滚动条槽,窗格矩形因此恰好铺满区域,由客户端自行绘制分隔线;默认的 `server` 保留已配置的外观。控制流打开期间,无论由哪个客户端引起的几何变更,都会在终端调整尺寸之前向流发送一条 `tab.layout` 记录。它携带该标签页的 `PaneLayoutSnapshot`,其中每个窗格的矩形是应用边框、滚动槽和缩放之后终端实际被设置到的内部区域。由于该记录与 `terminal.output` 共享同一条有序通道,客户端总是在收到按新尺寸绘制的重绘之前拿到新矩形。`session.snapshot` 中的布局使用服务器的共享视图区域和窗格的外部矩形,因此在某个标签页的第一条 `tab.layout` 到达前,请只把它们当作拓扑信息。该认领遵循与查看该标签页的 Herdr 客户端相同的规则,因此最后交互的客户端获胜。使用 `geometry: "terminal"` 的附加则改为通过 `terminal.resize` 设置单个终端的尺寸,并把标签页布局排除在外;它分离后,标签页的几何控制器会重新为该终端设置尺寸。
 
 ## 读取窗格
 
