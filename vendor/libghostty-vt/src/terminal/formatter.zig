@@ -1153,6 +1153,14 @@ pub const PageFormatter = struct {
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
                 if (blank_cells > 0) {
+                    // Accumulated empty cells have the default style. Close
+                    // the preceding cell's style before writing the gap so
+                    // its background and attributes don't bleed into it.
+                    if (!style.default()) {
+                        try self.formatStyleClose(writer);
+                        style = .{};
+                    }
+
                     try writer.splatByteAll(' ', blank_cells);
 
                     if (self.point_map) |*map| {
@@ -3534,6 +3542,46 @@ test "Page VT multi-line with styles" {
 
     // Verify point map matches output length
     try testing.expectEqual(output.len, point_map.items.len);
+}
+
+test "Page styles close before empty cell gaps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[48;5;12mBAR  \x1b[0m\x1b[1;10HRIGHT");
+
+    const page = t.screens.active.pages.pages.last.?.page();
+    const Case = struct { emit: Format, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .emit = .plain, .expected = "BAR      RIGHT" },
+        .{
+            .emit = .vt,
+            .expected = "\x1b[0m\x1b[48;5;12mBAR  \x1b[0m    RIGHT",
+        },
+        .{
+            .emit = .html,
+            .expected = "<div style=\"font-family: monospace; white-space: pre;\">" ++
+                "<div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
+                "BAR  </div>    RIGHT</div>",
+        },
+    };
+    for (cases) |case| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: PageFormatter = .init(page, .{ .emit = case.emit });
+        var point_map: std.ArrayList(Coordinate) = .empty;
+        defer point_map.deinit(alloc);
+        formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+        try formatter.format(&builder.writer);
+        const output = builder.writer.buffered();
+        try testing.expectEqualStrings(case.expected, output);
+        try testing.expectEqual(output.len, point_map.items.len);
+    }
 }
 
 test "Page VT duplicate style not emitted twice" {

@@ -75,3 +75,41 @@ cargo nextest run --locked modify_other_keys_query_tracks_mode_two
 cargo nextest run --locked host_report_all_supplies_printable_releases_for_event_type_only_panes
 python3 -m unittest scripts.test_vendor_libghostty_vt scripts.test_ui_hot_path_architecture
 ```
+
+## 0003 reset style before empty cell gaps
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0003-reset-style-before-empty-cell-gaps.patch`
+
+herdr issue: none; reported during local fork control-mode restore testing
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/formatter.zig`
+
+reason: When formatting untouched cells between a styled label and later text,
+the formatter emitted spaces before closing the label's style. Replaying a
+control-mode snapshot consequently extended background colors and attributes
+across the gap. Close the previous style before emitting default-style blanks,
+while preserving explicitly styled spaces and output coordinate mapping.
+
+remove when: the vendored formatter resets the previous style before emitting
+accumulated default-style blanks, and both the formatter and rendered snapshot
+replay regressions pass without this patch.
+
+verification (Zig 0.15.2):
+
+```sh
+cd vendor/libghostty-vt
+zig build test-lib-vt -Demit-lib-vt -Dtest-filter=formatter -Demit-xcframework=false
+cd ../..
+cargo test --locked --bin herdr raw_snapshot
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```

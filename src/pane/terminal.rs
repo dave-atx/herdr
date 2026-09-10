@@ -5389,6 +5389,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raw_snapshot_preserves_styles_around_empty_cell_gaps() {
+        fn rendered(pane: &GhosttyPaneTerminal) -> ratatui::buffer::Buffer {
+            let backend = ratatui::backend::TestBackend::new(40, 6);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| pane.render(frame, Rect::new(0, 0, 40, 6), false))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        for alternate in [false, true] {
+            for style in ["48;5;12", "48;2;17;34;51", "7;4"] {
+                let (tx, _rx) = mpsc::channel(4);
+                let terminal = crate::ghostty::Terminal::new(40, 6, 100).unwrap();
+                let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                let pane_id = PaneId::from_raw(1);
+                let screen = if alternate { "\x1b[?1049h" } else { "" };
+                // Explicitly printed spaces retain the label's style. The
+                // untouched gap before RIGHT must keep the default style.
+                let draw = format!(
+                    "{screen}\x1b[{style}mBAR  \x1b[0m\x1b[1;30H\x1b[32mRIGHT\x1b[0m\x1b[3;1Hnext\x1b[1;2H"
+                );
+                pane.process_pty_bytes(pane_id, 0, draw.as_bytes(), &tx);
+                let original = rendered(&pane);
+                assert_eq!(original[(5, 0)].style().bg, Some(Color::Reset));
+
+                let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                let (restored_tx, _restored_rx) = mpsc::channel(4);
+                let terminal = crate::ghostty::Terminal::new(40, 6, 100).unwrap();
+                let restored = GhosttyPaneTerminal::new(terminal, restored_tx.clone()).unwrap();
+                let replay = format!(
+                    "\x1b[3J\x1b[2J\x1b[H{}{screen}\x1b[H{}{}\x1b[{};{}H",
+                    snapshot.primary.as_deref().unwrap_or(""),
+                    snapshot.alternate.as_deref().unwrap_or(""),
+                    snapshot.state_ansi,
+                    snapshot.cursor.y + 1,
+                    snapshot.cursor.x + 1,
+                );
+                restored.process_pty_bytes(pane_id, 0, replay.as_bytes(), &restored_tx);
+                let actual = rendered(&restored);
+                // Compare rendered cells, not reserialized ANSI: a formatter
+                // bug can produce the same bad ANSI for source and replay.
+                for y in 0..6 {
+                    for x in 0..40 {
+                        assert_eq!(
+                            (actual[(x, y)].symbol(), actual[(x, y)].style()),
+                            (original[(x, y)].symbol(), original[(x, y)].style()),
+                            "alternate={alternate} style={style} cell=({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A wide glyph on the last two columns puts the cursor on its spacer
     /// tail; the snapshot reprints the whole glyph from one column left.
     #[test]
