@@ -1794,8 +1794,7 @@ impl GhosttyPaneTerminal {
         let (active_screen, primary, alternate, truncated) =
             match core.terminal.active_screen().ok()? {
                 crate::ghostty::ActiveScreen::Primary => {
-                    let mut text = ghostty_recent_ansi(core, usize::MAX, true).ok()?;
-                    pad_to_screen_bottom(&core.terminal, &mut text);
+                    let text = raw_primary_ansi(&core.terminal).ok()?;
                     let (text, truncated) = truncate_history_tail(text, history_limit_bytes);
                     (TerminalScreenKind::Primary, Some(text), None, truncated)
                 }
@@ -2999,29 +2998,36 @@ fn pending_wrap_cell_ansi(terminal: &crate::ghostty::Terminal, x: u16, y: u16) -
     })
 }
 
-/// Keep at most `limit` trailing bytes of history, cut on a line boundary
-/// so the first kept line starts clean. Returns whether anything was cut.
-/// The recent read stops at the last content row, but a client replaying
-/// history plus screen needs the blank rows under the content too: without
-/// them the history scrolls the content down to the bottom and the cursor
-/// position no longer matches. Append one line break per missing row.
-fn pad_to_screen_bottom(terminal: &crate::ghostty::Terminal, text: &mut String) {
-    let Ok(Some((_, end, _))) = ghostty_recent_read_range(terminal, usize::MAX) else {
-        return;
-    };
-    let Ok(total_rows) = terminal.total_rows() else {
-        return;
-    };
-    let last_row = total_rows.saturating_sub(1);
-    let mut missing = last_row.saturating_sub(end);
-    if text.ends_with('\n') {
-        missing = missing.saturating_sub(1);
+/// Serialize through the last row the VT formatter actually emits, then
+/// include every blank row below it. The recent-text range also includes the
+/// cursor, but the formatter trims trailing blank rows even when the cursor is
+/// on one of them. Padding from that range loses rows and shifts the screen.
+/// This runs only on raw attach/re-snapshot, not on PTY output or rendering.
+fn raw_primary_ansi(terminal: &crate::ghostty::Terminal) -> Result<String, crate::ghostty::Error> {
+    let total_rows = terminal.total_rows()?;
+    let cols = terminal.cols()?;
+    for end in (0..total_rows).rev() {
+        let row = terminal.read_ansi_screen(
+            (0, end as u32),
+            (cols.saturating_sub(1), end as u32),
+            false,
+            true,
+        )?;
+        if row.is_empty() {
+            continue;
+        }
+        let mut text =
+            terminal.read_ansi_screen((0, 0), (cols.saturating_sub(1), end as u32), false, true)?;
+        for _ in end + 1..total_rows {
+            text.push_str("\r\n");
+        }
+        return Ok(text);
     }
-    for _ in 0..missing {
-        text.push_str("\r\n");
-    }
+    Ok(String::new())
 }
 
+/// Keep at most `limit` trailing bytes of history, cut on a line boundary
+/// so the first kept line starts clean. Returns whether anything was cut.
 fn truncate_history_tail(text: String, limit: usize) -> (String, bool) {
     if text.len() <= limit {
         return (text, false);
@@ -5333,6 +5339,54 @@ mod tests {
         let row1 = core.terminal.cell_ansi(0, 19, 1).unwrap();
         assert!(row1.contains("row1"), "row1: {row1:?}");
         assert_eq!(core.terminal.cursor_y().unwrap(), 1);
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_blank_rows_independently_of_cursor() {
+        for history in [0, 40] {
+            for leading in [0, 2] {
+                for cursor_row in [leading + 1, 11] {
+                    let (tx, _rx) = mpsc::channel(4);
+                    let terminal = crate::ghostty::Terminal::new(40, 24, 100).unwrap();
+                    let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                    let pane_id = PaneId::from_raw(1);
+                    let draw = format!(
+                        "{}\x1b[2J\x1b[H{}before\r\nprompt\r\nafter\x1b[{};3H",
+                        "history\r\n".repeat(history),
+                        "\r\n".repeat(leading),
+                        cursor_row + 1,
+                    );
+                    pane.process_pty_bytes(pane_id, 0, draw.as_bytes(), &tx);
+                    let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                    let original = {
+                        let core = pane.core.lock().unwrap();
+                        (0..24)
+                            .map(|y| core.terminal.cell_ansi(0, 39, y).unwrap())
+                            .collect::<Vec<_>>()
+                    };
+                    let (restored_tx, _restored_rx) = mpsc::channel(4);
+                    let terminal = crate::ghostty::Terminal::new(40, 24, 100).unwrap();
+                    let restored = GhosttyPaneTerminal::new(terminal, restored_tx.clone()).unwrap();
+                    let replay = format!(
+                        "\x1b[3J\x1b[2J\x1b[H{}{}\x1b[{};{}H",
+                        snapshot.primary.as_deref().unwrap(),
+                        snapshot.state_ansi,
+                        snapshot.cursor.y + 1,
+                        snapshot.cursor.x + 1,
+                    );
+                    restored.process_pty_bytes(pane_id, 0, replay.as_bytes(), &restored_tx);
+                    let core = restored.core.lock().unwrap();
+                    let actual = (0..24)
+                        .map(|y| core.terminal.cell_ansi(0, 39, y).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, original,
+                        "history={history} leading={leading} cursor={cursor_row}"
+                    );
+                    assert_eq!(core.terminal.cursor_y().unwrap(), cursor_row as u16);
+                }
+            }
+        }
     }
 
     /// A wide glyph on the last two columns puts the cursor on its spacer
