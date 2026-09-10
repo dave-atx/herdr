@@ -1806,7 +1806,10 @@ impl GhosttyPaneTerminal {
 
         // The active cursor, not the viewport's: another client may have
         // scrolled this pane back, which must not move the client's cursor.
-        let shape = current_cursor_state(core).map_or(0, |cursor| cursor.shape);
+        // Style belongs to the active cursor even when scrolling hides it
+        // from the viewport; a viewport cursor query then returns no value.
+        core.render_state.update(&core.terminal).ok()?;
+        let shape = cursor_shape_from_render_state(&core.render_state, &core.decscusr_tracker);
         let cursor = TerminalCursorState {
             x: core.terminal.cursor_x().unwrap_or(0),
             y: core.terminal.cursor_y().unwrap_or(0),
@@ -1838,13 +1841,19 @@ impl GhosttyPaneTerminal {
         // app ends the batch. Scrolling regions, tab stops, charsets, and the
         // keyboard protocols come from the formatter below.
         let mut state_ansi = String::new();
-        for (number, enabled) in [
+        let modes = [
             (
                 crate::ghostty::MODE_APPLICATION_CURSOR_KEYS,
                 application_cursor,
             ),
+            (5, mode(5)), // Reverse video.
             (MODE_ORIGIN, mode(MODE_ORIGIN)),
             (MODE_AUTOWRAP, mode(MODE_AUTOWRAP)),
+            (8, mode(8)),   // Autorepeat.
+            (12, mode(12)), // Cursor blinking.
+            (45, mode(45)), // Reverse wrap.
+            (66, mode(66)), // Application keypad.
+            (67, mode(67)), // Backspace sends BS rather than DEL.
             // Ahead of the formatter's DECSLRM: margins are ignored while
             // the mode is off.
             (MODE_LEFT_RIGHT_MARGIN, mode(MODE_LEFT_RIGHT_MARGIN)),
@@ -1865,7 +1874,12 @@ impl GhosttyPaneTerminal {
                 crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL,
                 mouse_alternate_scroll,
             ),
+            (1015, mode(1015)), // URXVT mouse encoding.
             (crate::ghostty::MODE_MOUSE_SGR_PIXELS, sgr_pixel_mouse),
+            (1035, mode(1035)), // Num Lock overrides application keypad.
+            (1036, mode(1036)), // Alt escape prefix.
+            (1039, mode(1039)), // Alt sends escape.
+            (1045, mode(1045)), // Extended reverse wrap.
             (crate::ghostty::MODE_BRACKETED_PASTE, bracketed_paste),
             (
                 crate::ghostty::MODE_GRAPHEME_CLUSTER,
@@ -1875,21 +1889,36 @@ impl GhosttyPaneTerminal {
                 crate::ghostty::MODE_COLOR_SCHEME_REPORT,
                 color_scheme_reporting,
             ),
-        ] {
-            state_ansi.push_str(&format!(
-                "\x1b[?{number}{}",
-                if enabled { 'h' } else { 'l' }
-            ));
+            (2048, mode(2048)), // In-band size reports.
+        ];
+        // Mouse tracking and encoding are mutually exclusive in the parser:
+        // disabling any one resets the effective mode, even if another mode
+        // bit remains set. Apply all disables before enabling the saved modes.
+        for enabled in [false, true] {
+            for (number, value) in modes {
+                if value == enabled {
+                    state_ansi.push_str(&format!(
+                        "\x1b[?{number}{}",
+                        if enabled { 'h' } else { 'l' }
+                    ));
+                }
+            }
         }
-        // Insert mode is an ANSI mode, so no `?`.
-        state_ansi.push_str(if mode(MODE_INSERT) {
-            "\x1b[4h"
-        } else {
-            "\x1b[4l"
-        });
+        // Keyboard lock, insert, local echo, and newline are ANSI modes.
+        for (number, enabled) in [
+            (2, mode(2 | 0x8000)),
+            (4, mode(MODE_INSERT)),
+            (12, mode(12 | 0x8000)),
+            (20, mode(20 | 0x8000)),
+        ] {
+            state_ansi.push_str(&format!("\x1b[{number}{}", if enabled { 'h' } else { 'l' }));
+        }
         if let Ok(extra) = terminal.raw_attach_state_ansi() {
             state_ansi.push_str(&extra);
         }
+        // A re-snapshot can reuse a terminal with an old keyboard stack.
+        // Clear it before rebuilding, including when the saved state is off.
+        state_ansi.push_str("\x1b[<65535u\x1b[=0u\x1b[>4;0m");
         // The tracker replays the pushed Kitty keyboard stack, not just the
         // current flags, so a later pop lands on the same state client side.
         if let Some(keyboard) = core.kitty_keyboard.replay_ansi() {
@@ -1900,8 +1929,11 @@ impl GhosttyPaneTerminal {
         } else {
             "\x1b[?25l"
         });
-        if cursor.shape > 0 {
-            state_ansi.push_str(&format!("\x1b[{} q", cursor.shape));
+        // Shape zero restores the client default instead of retaining an
+        // old application's shape. Reapply cursor blinking after that reset.
+        state_ansi.push_str(&format!("\x1b[{} q", cursor.shape));
+        if cursor.shape == 0 {
+            state_ansi.push_str(if mode(12) { "\x1b[?12h" } else { "\x1b[?12l" });
         }
         let pen_ansi = terminal.pen_ansi().unwrap_or_default();
 
@@ -2605,7 +2637,20 @@ fn cursor_state_from_render_state(
     decscusr_tracker: &DecscusrTracker,
 ) -> Option<TerminalCursorState> {
     let cursor = render_state.cursor_viewport().ok()??;
-    let shape = if decscusr_tracker.cursor_shape_overridden() {
+    let shape = cursor_shape_from_render_state(render_state, decscusr_tracker);
+    Some(TerminalCursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: render_state.cursor_visible().ok()?,
+        shape,
+    })
+}
+
+fn cursor_shape_from_render_state(
+    render_state: &crate::ghostty::RenderState,
+    decscusr_tracker: &DecscusrTracker,
+) -> u8 {
+    if decscusr_tracker.cursor_shape_overridden() {
         render_state
             .cursor_visual_style()
             .ok()
@@ -2614,13 +2659,7 @@ fn cursor_state_from_render_state(
             .unwrap_or(0)
     } else {
         0
-    };
-    Some(TerminalCursorState {
-        x: cursor.x,
-        y: cursor.y,
-        visible: render_state.cursor_visible().ok()?,
-        shape,
-    })
+    }
 }
 
 type VisibleHyperlinks = Vec<((u16, u16), String, String)>;
@@ -5166,6 +5205,278 @@ mod tests {
             restored.keyboard_protocol(),
             Some(crate::input::KeyboardProtocol::Kitty { flags: 1 })
         );
+    }
+
+    fn snapshot_test_pane(bytes: &[u8]) -> GhosttyPaneTerminal {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, bytes, &tx);
+        pane
+    }
+
+    fn replay_test_snapshot(pane: &GhosttyPaneTerminal, stale: &[u8]) -> GhosttyPaneTerminal {
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let restored = snapshot_test_pane(stale);
+        let mut core = restored.core.lock().unwrap();
+        // The same screen/mode normalization used by the raw control client.
+        core.terminal.write(b"\x1b[?1049l\x1b[0m\x1b[r\x1b[?69l\x1b[?6l\x1b[?7h\x1b[4l\x1b(B\x0f\x1b[3J\x1b[2J\x1b[H");
+        if let Some(primary) = &snapshot.primary {
+            core.terminal.write(primary.as_bytes());
+        }
+        if let Some(alternate) = &snapshot.alternate {
+            core.terminal.write(b"\x1b[?1049h\x1b[2J\x1b[H");
+            core.terminal.write(alternate.as_bytes());
+        }
+        core.terminal.write(snapshot.state_ansi.as_bytes());
+        drop(core);
+        restored
+    }
+
+    #[test]
+    fn raw_snapshot_replays_mouse_protocols() {
+        use crate::ghostty::{ffi, MouseEncoder, MouseEvent};
+
+        fn reports(pane: &GhosttyPaneTerminal) -> Vec<Vec<u8>> {
+            let core = pane.core.lock().unwrap();
+            let mut encoder = MouseEncoder::new().unwrap();
+            encoder.set_from_terminal(&core.terminal);
+            encoder.set_size(640, 192, 8, 8);
+            let mut event = MouseEvent::new().unwrap();
+            event.set_position(20.0, 30.0);
+            let mut result = Vec::new();
+            for (action, button) in [
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS, true),
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_RELEASE, true),
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_MOTION, true),
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_MOTION, false),
+            ] {
+                event.set_action(action);
+                if button {
+                    event.set_button(ffi::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_LEFT);
+                } else {
+                    event.clear_button();
+                }
+                result.push(encoder.encode(&event).unwrap());
+            }
+            result
+        }
+
+        for alternate in [false, true] {
+            for tracking in [0, 9, 1000, 1002, 1003] {
+                for encoding in [0, 1005, 1006, 1015, 1016] {
+                    let mut setup = String::from(if alternate { "\x1b[?1049h" } else { "" });
+                    for mode in [tracking, encoding] {
+                        if mode != 0 {
+                            setup.push_str(&format!("\x1b[?{mode}h"));
+                        }
+                    }
+                    let pane = snapshot_test_pane(setup.as_bytes());
+                    let expected = reports(&pane);
+                    assert_eq!(!expected[0].is_empty(), tracking != 0);
+                    for stale in ["", "\x1b[?1003h\x1b[?1016h"] {
+                        let restored = replay_test_snapshot(&pane, stale.as_bytes());
+                        // Mode bits alone miss disabled encoder state. Check
+                        // actual press, release, drag, and motion bytes.
+                        assert_eq!(
+                            reports(&restored), expected,
+                            "alternate={alternate} tracking={tracking} encoding={encoding} stale={stale:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_replays_input_and_display_modes() {
+        for mode in [
+            1,
+            5,
+            8,
+            12,
+            25,
+            45,
+            66,
+            67,
+            1004,
+            1007,
+            1035,
+            1036,
+            1039,
+            1045,
+            2004,
+            2027,
+            2031,
+            2048,
+            2 | 0x8000,
+            4 | 0x8000,
+            12 | 0x8000,
+            20 | 0x8000,
+        ] {
+            let number = mode & 0x7fff;
+            let prefix = if mode & 0x8000 == 0 { "?" } else { "" };
+            for enabled in [false, true] {
+                let setup = format!("\x1b[{prefix}{number}{}", if enabled { 'h' } else { 'l' });
+                let stale = format!("\x1b[{prefix}{number}{}", if enabled { 'l' } else { 'h' });
+                let pane = snapshot_test_pane(setup.as_bytes());
+                let restored = replay_test_snapshot(&pane, stale.as_bytes());
+                assert_eq!(
+                    restored
+                        .core
+                        .lock()
+                        .unwrap()
+                        .terminal
+                        .mode_get(mode)
+                        .unwrap(),
+                    enabled,
+                    "mode={number} prefix={prefix} enabled={enabled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_replays_tabstops_with_origin_and_margins() {
+        let pane = snapshot_test_pane(
+            b"\x1b[3g\x1b[1;3H\x1bH\x1b[1;17H\x1bH\x1b[?69h\x1b[5;60s\x1b[3;10r\x1b[?6h",
+        );
+        let restored = replay_test_snapshot(&pane, b"");
+        for terminal in [&pane, &restored] {
+            let mut core = terminal.core.lock().unwrap();
+            core.terminal.write(b"\x1b[?6l\x1b[?69l\x1b[H\t");
+            assert_eq!(core.terminal.cursor_x().unwrap(), 2);
+            core.terminal.write(b"\t");
+            assert_eq!(core.terminal.cursor_x().unwrap(), 16);
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_clears_stale_keyboard_and_pen_state() {
+        let pane = snapshot_test_pane(b"");
+        let restored = replay_test_snapshot(
+            &pane,
+            b"\x1b[>1u\x1b[>5u\x1b[>4;2m\x1b[1\"q\x1b]8;;https://example.test/stale\x1b\\\x1b)0",
+        );
+        let mut core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 0);
+        assert!(!core.terminal.modify_other_keys_enabled().unwrap());
+        assert_eq!(
+            core.terminal.pen_ansi().unwrap(),
+            pane.core.lock().unwrap().terminal.pen_ansi().unwrap()
+        );
+        core.terminal.write(b"\x1b[H\x0eq");
+        assert_eq!(
+            core.terminal.screen_cell(0, 0).unwrap().1,
+            vec![u32::from('q')]
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_replays_keypad_backspace_and_newline_behavior() {
+        use crate::ghostty::{ffi, KeyEncoder, KeyEvent};
+
+        for enabled in [false, true] {
+            let setup = if enabled {
+                b"\x1b[?66h\x1b[?67h\x1b[?1035l\x1b[20h".as_slice()
+            } else {
+                b"\x1b[?66l\x1b[?67l\x1b[?1035h\x1b[20l".as_slice()
+            };
+            let pane = snapshot_test_pane(setup);
+            let restored = replay_test_snapshot(&pane, b"");
+            for terminal in [&pane, &restored] {
+                let mut core = terminal.core.lock().unwrap();
+                let mut encoder = KeyEncoder::new().unwrap();
+                encoder.set_from_terminal(&core.terminal);
+                let mut event = KeyEvent::new().unwrap();
+                event.set_action(ffi::GhosttyKeyAction_GHOSTTY_KEY_ACTION_PRESS);
+                event.set_key(ffi::GhosttyKey_GHOSTTY_KEY_BACKSPACE);
+                assert_eq!(
+                    encoder.encode(&event).unwrap(),
+                    if enabled { b"\x08" } else { b"\x7f" }
+                );
+                event.set_key(ffi::GhosttyKey_GHOSTTY_KEY_NUMPAD_1);
+                event.set_utf8("1");
+                assert_eq!(
+                    encoder.encode(&event).unwrap(),
+                    if enabled {
+                        b"\x1bOq".as_slice()
+                    } else {
+                        b"1".as_slice()
+                    }
+                );
+                core.terminal.write(b"\x1b[2;8H\n");
+                assert_eq!(
+                    core.terminal.cursor_x().unwrap(),
+                    if enabled { 0 } else { 7 }
+                );
+                assert_eq!(core.terminal.cursor_y().unwrap(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_repeated_replay_preserves_keyboard_stack() {
+        let pane = snapshot_test_pane(b"\x1b[>1u\x1b[>5u\x1b[>4;1m");
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let restored = replay_test_snapshot(&pane, snapshot.state_ansi.as_bytes());
+        let mut core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 5);
+        core.terminal.write(b"\x1b[<u");
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 1);
+        core.terminal.write(b"\x1b[<u");
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 0);
+    }
+
+    #[test]
+    fn raw_snapshot_replays_active_hyperlink_protection_and_charset() {
+        let pane = snapshot_test_pane(
+            b"\x1b[1\"q\x1b]8;;https://example.test/current\x1b\\\x1b)0\x0e\x1b[31m",
+        );
+        let restored = replay_test_snapshot(&pane, b"");
+        let expected_pen = pane.core.lock().unwrap().terminal.pen_ansi().unwrap();
+        let mut core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.pen_ansi().unwrap(), expected_pen);
+        core.terminal.write(b"\x1b[Hq");
+        assert_eq!(
+            core.terminal.screen_cell(0, 0).unwrap().1,
+            vec![u32::from('─')]
+        );
+        assert_eq!(
+            core.terminal
+                .viewport_hyperlink_uri(0, 0)
+                .unwrap()
+                .as_deref(),
+            Some("https://example.test/current")
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_replays_cursor_shape_even_when_scrolled_back() {
+        fn appearance(pane: &GhosttyPaneTerminal) -> (crate::ghostty::CursorVisualStyle, bool) {
+            let core = pane.core.lock().unwrap();
+            let mut render = crate::ghostty::RenderState::new().unwrap();
+            render.update(&core.terminal).unwrap();
+            (
+                render.cursor_visual_style().unwrap(),
+                render.cursor_blinking().unwrap(),
+            )
+        }
+        for shape in 0..=6 {
+            for scrolled in [false, true] {
+                let setup = format!("{}\x1b[{shape} q", "history\r\n".repeat(40));
+                let pane = snapshot_test_pane(setup.as_bytes());
+                if scrolled {
+                    pane.scroll_up(10);
+                }
+                let restored = replay_test_snapshot(&pane, b"\x1b[6 q");
+                assert_eq!(
+                    appearance(&restored),
+                    appearance(&pane),
+                    "shape={shape} scrolled={scrolled}"
+                );
+            }
+        }
     }
 
     /// The pen survives an attach: text typed after the snapshot keeps the

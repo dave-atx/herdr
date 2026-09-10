@@ -1308,20 +1308,32 @@ impl Terminal {
     /// hyperlink, and protection). Keyboard protocols come from the pane's
     /// tracker, which knows the pushed Kitty stack.
     pub fn raw_attach_state_ansi(&self) -> Result<String, Error> {
-        self.format_state_only_ansi(ffi::GhosttyFormatterTerminalExtra {
-            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
-            scrolling_region: true,
-            tabstops: true,
-            screen: ffi::GhosttyFormatterScreenExtra {
-                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
-                style: true,
-                hyperlink: true,
-                protection: true,
-                charsets: true,
+        // Extras omit default hyperlink, protection, and charset state. Clear
+        // stale state when reusing a client terminal, then apply saved extras.
+        // HTS positions are absolute columns, so origin mode must be off while
+        // the formatter restores tabstops, even with active scrolling margins.
+        let mut ansi =
+            String::from("\x1b[?6l\x1b]8;;\x1b\\\x1b[0\"q\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}");
+        ansi.push_str(
+            &self.format_state_only_ansi(ffi::GhosttyFormatterTerminalExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+                scrolling_region: true,
+                tabstops: true,
+                screen: ffi::GhosttyFormatterScreenExtra {
+                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                    style: true,
+                    hyperlink: true,
+                    protection: true,
+                    charsets: true,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        })
+            })?,
+        );
+        if self.mode_get(6)? {
+            ansi.push_str("\x1b[?6h");
+        }
+        Ok(ansi)
     }
 
     /// The formatter always emits content ahead of the extras, so format
