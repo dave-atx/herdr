@@ -5756,6 +5756,119 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raw_snapshot_preserves_background_only_rows() {
+        fn rendered(pane: &GhosttyPaneTerminal) -> ratatui::buffer::Buffer {
+            let backend = ratatui::backend::TestBackend::new(20, 8);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 8), false))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        fn assert_same(source: &GhosttyPaneTerminal, restored: &GhosttyPaneTerminal, case: &str) {
+            let expected = rendered(source);
+            let actual = rendered(restored);
+            for y in 0..8 {
+                for x in 0..20 {
+                    assert_eq!(
+                        (actual[(x, y)].symbol(), actual[(x, y)].style()),
+                        (expected[(x, y)].symbol(), expected[(x, y)].style()),
+                        "{case} cell=({x},{y})"
+                    );
+                }
+            }
+        }
+
+        for alternate in [false, true] {
+            for history in [false, true] {
+                for style in ["48;5;12", "48;2;17;34;51"] {
+                    for whole_screen in [false, true] {
+                        let case = format!(
+                            "alternate={alternate} history={history} style={style} whole={whole_screen}"
+                        );
+                        let (tx, _rx) = mpsc::channel(4);
+                        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+                        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                        let pane_id = PaneId::from_raw(1);
+                        let bg = format!("\x1b[{style}m");
+                        let mut draw = String::new();
+                        if history {
+                            for n in 0..12 {
+                                draw.push_str(&format!("{bg}\x1b[2K\x1b[0m\r\nhistory {n}\r\n"));
+                            }
+                        }
+                        if alternate {
+                            draw.push_str("\x1b[?1049h");
+                        }
+                        draw.push_str("\x1b[0m\x1b[2J\x1b[H");
+                        if whole_screen {
+                            draw.push_str(&format!("{bg}\x1b[2J\x1b[0m"));
+                        } else {
+                            // Leading, intervening, and trailing background-only
+                            // rows, plus an unstyled row and a partial erased fill.
+                            draw.push_str(&format!(
+                                "{bg}\x1b[2K\x1b[0m\r\n\
+                                 {bg}> 漢e\u{301}\x1b[K\x1b[0m\r\n\
+                                 {bg}\x1b[K\x1b[0m\r\n\r\n\
+                                 \x1b[5;5H{bg}\x1b[8X\x1b[0m\r\n\
+                                 {bg}                    \x1b[0m\r\n\
+                                 label\r\n{bg}\x1b[2K\x1b[0m"
+                            ));
+                        }
+                        draw.push_str("\x1b[2;2H");
+                        pane.process_pty_bytes(pane_id, 0, draw.as_bytes(), &tx);
+                        assert_ne!(rendered(&pane)[(0, 0)].style().bg, Some(Color::Reset));
+
+                        let (restored_tx, _restored_rx) = mpsc::channel(4);
+                        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+                        let restored =
+                            GhosttyPaneTerminal::new(terminal, restored_tx.clone()).unwrap();
+                        for _ in 0..2 {
+                            let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                            let screen = if alternate {
+                                "\x1b[?1049h\x1b[2J\x1b[H"
+                            } else {
+                                ""
+                            };
+                            let replay = format!(
+                                "\x1b[?1049l\x1b[0m\x1b[r\x1b[?69l\x1b[?6l\x1b[?7h\x1b[4l\x1b(B\x0f\
+                                 \x1b[3J\x1b[2J\x1b[H{}{screen}{}{}\x1b[{};{}H",
+                                snapshot.primary.as_deref().unwrap_or(""),
+                                snapshot.alternate.as_deref().unwrap_or(""),
+                                snapshot.state_ansi,
+                                snapshot.cursor.y + 1,
+                                snapshot.cursor.x + 1,
+                            );
+                            restored.process_pty_bytes(pane_id, 0, replay.as_bytes(), &restored_tx);
+                            assert_same(&pane, &restored, &case);
+                            let core = restored.core.lock().unwrap();
+                            assert_eq!(core.terminal.cursor_x().unwrap(), snapshot.cursor.x);
+                            assert_eq!(core.terminal.cursor_y().unwrap(), snapshot.cursor.y);
+                            drop(core);
+
+                            if history && !alternate {
+                                pane.scroll_up(100);
+                                restored.scroll_up(100);
+                                assert_same(&pane, &restored, &format!("{case} scrollback"));
+                                pane.scroll_down(100);
+                                restored.scroll_down(100);
+                            }
+                        }
+
+                        // Continuing live output must agree with the original
+                        // terminal, including a new background-only row.
+                        let next = format!("\x1b[8;1H\r\n{bg}\x1b[2K\x1b[0m\r\ncontinued");
+                        pane.process_pty_bytes(pane_id, 0, next.as_bytes(), &tx);
+                        restored.process_pty_bytes(pane_id, 0, next.as_bytes(), &restored_tx);
+                        assert_same(&pane, &restored, &format!("{case} continued"));
+                    }
+                }
+            }
+        }
+    }
+
     /// A wide glyph on the last two columns puts the cursor on its spacer
     /// tail; the snapshot reprints the whole glyph from one column left.
     #[test]

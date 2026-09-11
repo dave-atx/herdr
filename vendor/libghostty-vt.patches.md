@@ -113,3 +113,42 @@ cd ../..
 cargo test --locked --bin herdr raw_snapshot
 python3 -m unittest scripts.test_vendor_libghostty_vt
 ```
+
+## 0004 preserve background-only rows in styled output
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0004-preserve-background-only-rows.patch`
+
+herdr issue: none; reported during local fork control-mode restoration of Codex output
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/formatter.zig`
+
+reason: The formatter skipped rows containing no text, including rows filled
+with palette or RGB backgrounds by terminal erase operations. Raw control-mode
+snapshots consequently lost the fill although direct cell rendering remained
+correct. Classify styled rows using the same content/styling rules as the cell
+loop, restricted to the selected columns; keep plaintext blank-row behavior.
+The scan remains linear and adds no per-cell allocations or presentation work.
+
+remove when: the vendored formatter preserves background-only and styled empty
+rows, and both the formatter and rendered snapshot replay regressions pass
+without this patch.
+
+verification (Zig 0.15.2; set ZIG to that executable for Rust builds):
+
+```sh
+cd vendor/libghostty-vt
+zig build test-lib-vt -Demit-lib-vt -Dtest-filter=formatter -Demit-xcframework=false -Dversion-string=1.3.2-HEAD-+c5a21edfc
+cd ../..
+just test-one raw_snapshot
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```
