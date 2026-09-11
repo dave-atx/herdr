@@ -1,0 +1,165 @@
+name: Rootshell release
+
+on:
+  push:
+    tags:
+      - "rootshell-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rootshell-release
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+  LIBGHOSTTY_VT_SIMD: 'true'
+
+jobs:
+  build:
+    if: github.repository == 'kitknox/herdr'
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            name: herdr-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: runner.os != 'macOS'
+        with:
+          version: 0.15.2
+
+      - name: Install patched Zig on macOS
+        if: runner.os == 'macOS'
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install zig@0.15 cmake ninja
+          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+
+      - name: Set Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Remove Zig caches
+        shell: bash
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^rootshell-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          export HERDR_BUILD_CHANNEL=rootshell
+          export HERDR_BUILD_ID="${GITHUB_REF_NAME#rootshell-v}"
+          export HERDR_BUILD_COMMIT="$GITHUB_SHA"
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp target/${{ matrix.target }}/release/herdr "${{ matrix.name }}"
+          chmod +x "${{ matrix.name }}"
+          shasum -a 256 "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          .\scripts\package_windows_conpty.ps1 `
+            -HerdrExe "target\${{ matrix.target }}\release\herdr.exe" `
+            -PackagePath $package `
+            -StageDir $stage `
+            -OutputPath "${{ matrix.name }}"
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.name }}").Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.name }}" | Out-File -Encoding ascii "${{ matrix.name }}.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare installer and update manifest
+        run: |
+          python3 -m unittest scripts.test_rootshell_release
+          cp scripts/rootshell-install.sh release-assets/install.sh
+          python3 scripts/rootshell-manifest.py
+
+      - name: Create Rootshell prerelease
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          name: Rootshell ${{ github.ref_name }}
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Fork test build of Herdr for the Rootshell control-stream work.
+
+            Built from commit `${{ github.sha }}`. This release is not part of the official Herdr update channel. Download the asset for your platform and keep the official binary available for rollback.
+
+            Install on macOS/Linux:
+            ```sh
+            curl -fsSL https://github.com/kitknox/herdr/releases/download/rootshell-channel/install.sh | sh
+            ```
+            Open a new terminal after installation. Future upgrades: `herdr update`.
+            Save your work before restarting existing servers to enable new server features; stopping a server terminates pane processes.
+
+            Validation: the local macOS suite passed 3,166 tests. Two live-handoff tests also fail on the pre-release branch head (socket error and unmanaged-agent detection timeout). Experimental live handoff is not recommended for this test release; use a normal server restart after saving work.
+          files: release-assets/*
+
+      - name: Publish fork update channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/rootshell-manifest.py --promote

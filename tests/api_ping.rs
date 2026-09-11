@@ -303,7 +303,18 @@ fn ping_over_socket_returns_version() {
     );
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
-    assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
+    // Preview and fork builds include their build identity in both surfaces.
+    let version_output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("--version")
+        .output()
+        .expect("read binary version");
+    assert!(version_output.status.success());
+    let version_output = String::from_utf8(version_output.stdout).expect("UTF-8 version");
+    let version = version_output
+        .trim()
+        .strip_prefix("herdr ")
+        .expect("version prefix");
+    assert_eq!(value["result"]["version"], version);
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 22);

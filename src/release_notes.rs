@@ -88,9 +88,16 @@ fn release_notes_from_stored(
         return None;
     }
 
+    let (stored_comparable, current_comparable) = match (
+        stored.version.split_once("-rootshell."),
+        current_version.split_once("-rootshell."),
+    ) {
+        (Some((_, stored)), Some((_, current))) => (stored, current),
+        _ => (stored.version.as_str(), current_version),
+    };
     let preview = match (
-        crate::update::Version::parse(&stored.version),
-        crate::update::Version::parse(current_version),
+        crate::update::Version::parse(stored_comparable),
+        crate::update::Version::parse(current_comparable),
     ) {
         (Some(stored_version), Some(current_version)) => stored_version > current_version,
         _ => false,

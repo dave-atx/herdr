@@ -211,6 +211,26 @@ struct UpdateManifest {
     releases: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Deserialize)]
+struct RootshellUpdateManifest {
+    base_version: String,
+    #[serde(flatten)]
+    release: UpdateManifest,
+}
+
+fn release_info_from_rootshell_manifest(
+    manifest: &RootshellUpdateManifest,
+    current: &Version,
+) -> Result<Option<ReleaseInfo>, String> {
+    let base = Version::parse(&manifest.base_version).ok_or("invalid Rootshell base version")?;
+    let mut release = release_info_from_manifest_at_version(&manifest.release, current, false)?;
+    if let Some(release) = &mut release {
+        // Update installation and handoff verify the complete binary version string.
+        release.identity = format!("{base}-rootshell.{}", release.version);
+    }
+    Ok(release)
+}
+
 fn deserialize_manifest_releases<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, serde_json::Value>, D::Error>
@@ -382,11 +402,22 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
 }
 
 fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
+    release_info_from_manifest_at_version(
+        manifest,
+        &Version::current(),
+        crate::build_info::is_preview(),
+    )
+}
+
+fn release_info_from_manifest_at_version(
+    manifest: &UpdateManifest,
+    current: &Version,
+    installed_is_preview: bool,
+) -> Result<Option<ReleaseInfo>, String> {
     let latest = Version::parse(&manifest.version)
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
+    if !stable_channel_should_install(&latest, current, installed_is_preview) {
         return Ok(None); // up to date
     }
 
@@ -437,6 +468,60 @@ fn stable_channel_should_install(
     installed_is_preview: bool,
 ) -> bool {
     installed_is_preview || latest > current
+}
+
+#[test]
+fn rootshell_updates_compare_fork_versions_and_require_checksums() {
+    let (os, arch) = platform_target();
+    let mut manifest: UpdateManifest = serde_json::from_value(serde_json::json!({
+        "version": "0.1.1",
+        "notes": "Rootshell update",
+        "assets": {format!("{os}-{arch}"): {
+            "url": "https://github.com/kitknox/herdr/releases/download/rootshell-v0.1.1/herdr",
+            "sha256": "a".repeat(64)
+        }}
+    }))
+    .expect("valid test manifest");
+    let old = Version::parse("0.1.0").expect("version");
+    let same = Version::parse("0.1.1").expect("version");
+    let newer = Version::parse("0.2.0").expect("version");
+    assert!(
+        release_info_from_manifest_at_version(&manifest, &old, false)
+            .expect("update")
+            .is_some()
+    );
+    assert!(
+        release_info_from_manifest_at_version(&manifest, &same, false)
+            .expect("no update")
+            .is_none()
+    );
+    assert!(
+        release_info_from_manifest_at_version(&manifest, &newer, false)
+            .expect("no downgrade")
+            .is_none()
+    );
+    manifest
+        .assets
+        .get_mut(&format!("{os}-{arch}"))
+        .expect("asset")
+        .sha256 = None;
+    assert!(release_info_from_manifest_at_version(&manifest, &old, false).is_err());
+    manifest
+        .assets
+        .get_mut(&format!("{os}-{arch}"))
+        .expect("asset")
+        .sha256 = Some("a".repeat(64));
+    let fork = RootshellUpdateManifest {
+        base_version: "0.9.0".into(),
+        release: manifest,
+    };
+    assert_eq!(
+        release_info_from_rootshell_manifest(&fork, &old)
+            .expect("valid manifest")
+            .expect("update")
+            .label(),
+        "0.9.0-rootshell.0.1.1"
+    );
 }
 
 fn preview_display_version(base_version: &str, build_id: &str) -> String {
@@ -531,6 +616,16 @@ fn first_windows_stable_is_pending(
 }
 
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
+    // Fork identity is compiled into the binary, independent of shared user configuration.
+    if crate::build_info::channel() == "rootshell" {
+        let current = crate::build_info::build_id()
+            .and_then(Version::parse)
+            .ok_or("invalid Rootshell build version")?;
+        let manifest = fetch_json_manifest::<RootshellUpdateManifest>(
+            "https://github.com/kitknox/herdr/releases/download/rootshell-channel/rootshell.json",
+        )?;
+        return release_info_from_rootshell_manifest(&manifest, &current);
+    }
     let channel = UpdateChannel::configured();
     if channel == UpdateChannel::Preview {
         return release_info_from_preview_manifest(&fetch_preview_manifest()?);
