@@ -213,6 +213,22 @@ struct TabChromeSettings {
     scrollbars: bool,
 }
 
+/// True when a control connection owns this tab's geometry.
+pub(super) fn tab_geometry_is_control_owned(
+    app: &AppState,
+    ws_idx: usize,
+    tab: &crate::workspace::Tab,
+) -> bool {
+    !app.control_geometry_tabs.is_empty()
+        && app.workspaces.get(ws_idx).is_some_and(|workspace| {
+            app.control_geometry_tabs
+                .contains(&crate::workspace::public_tab_id_for_number(
+                    &workspace.id,
+                    tab.number,
+                ))
+        })
+}
+
 /// The server's chrome config, or none for a tab a control stream sizes
 /// chromeless (the client draws its own dividers and scrollbars).
 fn tab_chrome(app: &AppState, ws_idx: usize, tab: &crate::workspace::Tab) -> TabChromeSettings {

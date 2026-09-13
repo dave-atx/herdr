@@ -152,6 +152,7 @@ impl HeadlessServer {
         self.tab_geometry_controllers.retain(|tab_id, client_id| {
             topology.tab_workspace_ids.contains_key(tab_id) && live_clients.contains(client_id)
         });
+        self.sync_control_geometry_tabs();
         for client in self
             .clients
             .values_mut()
@@ -678,6 +679,7 @@ impl HeadlessServer {
                 self.tab_geometry_controllers.insert(tab_id, viewers[0]);
             }
         }
+        self.sync_control_geometry_tabs();
 
         if self.resize_tabs_for_only_shell_client(start_pending_agent_resumes) {
             return true;
@@ -728,7 +730,9 @@ impl HeadlessServer {
             return false;
         };
         self.note_tab_geometry_owner(&tab_id, client_id);
-        if self.tab_geometry_controllers.insert(tab_id, client_id) == Some(client_id) {
+        let previous = self.tab_geometry_controllers.insert(tab_id, client_id);
+        self.sync_control_geometry_tabs();
+        if previous == Some(client_id) {
             return false;
         }
         self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
@@ -754,6 +758,7 @@ impl HeadlessServer {
         }
         self.note_tab_geometry_owner(&tab_id, client_id);
         self.tab_geometry_controllers.insert(tab_id, client_id);
+        self.sync_control_geometry_tabs();
         self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
     }
 

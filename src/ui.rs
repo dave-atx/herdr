@@ -92,8 +92,21 @@ fn compute_view_internal(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
-    let TabSurfaceLayout { pane_infos, .. } =
-        compute_tab_surface(app, terminal_runtimes, area, resize_panes, cell_size);
+    // A control-owned tab is sized only by its controller, behind the
+    // layout boundary; herdr's own view must not resize its panes.
+    let active_is_control_owned = app.active.is_some_and(|ws_idx| {
+        app.workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.tabs.get(workspace.active_tab_index()))
+            .is_some_and(|tab| panes::tab_geometry_is_control_owned(app, ws_idx, tab))
+    });
+    let TabSurfaceLayout { pane_infos, .. } = compute_tab_surface(
+        app,
+        terminal_runtimes,
+        area,
+        resize_panes && !active_is_control_owned,
+        cell_size,
+    );
 
     if resize_panes {
         resize_background_tab_panes(app, terminal_runtimes, area, cell_size);
@@ -115,6 +128,13 @@ fn resize_background_tab_panes(
     for (workspace_index, workspace) in app.workspaces.iter().enumerate() {
         for tab_index in 0..workspace.tabs.len() {
             if app.active == Some(workspace_index) && tab_index == workspace.active_tab_index() {
+                continue;
+            }
+            if panes::tab_geometry_is_control_owned(
+                app,
+                workspace_index,
+                &workspace.tabs[tab_index],
+            ) {
                 continue;
             }
             resize_tab_surface(

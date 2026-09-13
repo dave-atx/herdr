@@ -248,6 +248,17 @@ impl PaneTerminal {
             .resize(rows, cols, cell_width_px, cell_height_px)
     }
 
+    pub fn resize_exact(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Vec<Bytes> {
+        self.ghostty
+            .resize_exact(rows, cols, cell_width_px, cell_height_px)
+    }
+
     pub fn scroll_up(&self, lines: usize) {
         self.ghostty.scroll_up(lines);
     }
@@ -1664,6 +1675,30 @@ impl GhosttyPaneTerminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Vec<Bytes> {
+        self.resize_with(rows, cols, cell_width_px, cell_height_px, true)
+    }
+
+    /// Resize with no model-only recovery: the screen becomes exactly what
+    /// libghostty's reflow produces, so a raw-tap client replaying the same
+    /// byte stream at the same size lands on the same grid.
+    pub fn resize_exact(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Vec<Bytes> {
+        self.resize_with(rows, cols, cell_width_px, cell_height_px, false)
+    }
+
+    fn resize_with(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        recover_bottom: bool,
+    ) -> Vec<Bytes> {
         if let Ok(mut core) = self.core.lock() {
             let offset_from_bottom = core
                 .terminal
@@ -1675,15 +1710,14 @@ impl GhosttyPaneTerminal {
                         .saturating_sub(scrollbar.offset + scrollbar.len)
                 })
                 .unwrap_or(0);
-            let bottom_before_resize = ghostty_detection_text(&mut core)
-                .map(|text| !text.trim().is_empty())
-                .unwrap_or(false);
             let resize_recovery_probe_lines = usize::from(rows)
                 .saturating_mul(8)
                 .max(DEFAULT_DETECTION_ROWS);
-            let replay_ansi = if core.terminal.active_screen().ok()
-                == Some(crate::ghostty::ActiveScreen::Primary)
-                && bottom_before_resize
+            let replay_ansi = if recover_bottom
+                && core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Primary)
+                && ghostty_detection_text(&mut core)
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
             {
                 ghostty_recent_ansi(&mut core, resize_recovery_probe_lines, true)
                     .ok()
@@ -1697,11 +1731,11 @@ impl GhosttyPaneTerminal {
                 .resize(cols, rows, cell_width_px, cell_height_px);
             let terminal_responses = self.drain_pending_pty_responses();
 
-            let bottom_is_blank = ghostty_detection_text(&mut core)
-                .map(|text| text.trim().is_empty())
-                .unwrap_or(false);
-            if bottom_is_blank {
-                if let Some(ansi) = replay_ansi.as_deref() {
+            if let Some(ansi) = replay_ansi.as_deref() {
+                let bottom_is_blank = ghostty_detection_text(&mut core)
+                    .map(|text| text.trim().is_empty())
+                    .unwrap_or(false);
+                if bottom_is_blank {
                     core.terminal.scroll_viewport_bottom();
                     core.terminal.write(ansi.as_bytes());
                 }
@@ -1713,7 +1747,7 @@ impl GhosttyPaneTerminal {
                 windows_recent_fallback::update(&mut core);
             }
             ghostty_set_scroll_offset_from_bottom(&mut core.terminal, offset_from_bottom);
-            if offset_from_bottom > 0 {
+            if recover_bottom && offset_from_bottom > 0 {
                 let mut remaining = offset_from_bottom.min(resize_recovery_probe_lines);
                 while remaining > 0
                     && ghostty_visible_text(&mut core)
@@ -2358,6 +2392,17 @@ impl GhosttyPaneTerminal {
     #[cfg(test)]
     pub fn recent_text(&self, lines: usize) -> String {
         self.recent_text_snapshot(lines).text
+    }
+
+    /// Screen rows as libghostty holds them, for comparison against a bare
+    /// terminal fed the same bytes.
+    #[cfg(test)]
+    pub(crate) fn recent_text_raw(&self, lines: usize) -> String {
+        self.core
+            .lock()
+            .ok()
+            .map(|core| recent_text_for_test(&core.terminal, lines))
+            .unwrap_or_default()
     }
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
@@ -3118,6 +3163,11 @@ fn finish_recent_snapshot(
             .total_rows()
             .is_ok_and(|total_rows| total_rows > lines),
     }
+}
+
+#[cfg(test)]
+pub(super) fn recent_text_for_test(terminal: &crate::ghostty::Terminal, lines: usize) -> String {
+    ghostty_recent_text_for_terminal(terminal, lines).unwrap_or_default()
 }
 
 fn ghostty_recent_text_for_terminal(

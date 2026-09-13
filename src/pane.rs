@@ -2913,9 +2913,15 @@ impl PaneRuntime {
             })
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
-        let mut terminal_responses =
+        // A raw-tap client replays this byte stream itself: the model must
+        // stay a pure function of it, so no recovery text is written back.
+        let mut terminal_responses = if self.raw_taps.has_taps() {
             self.terminal
-                .resize(rows, cols, cell_width_px, cell_height_px);
+                .resize_exact(rows, cols, cell_width_px, cell_height_px)
+        } else {
+            self.terminal
+                .resize(rows, cols, cell_width_px, cell_height_px)
+        };
         if self.raw_taps.suppress_terminal_responses() {
             terminal_responses.clear();
         }
@@ -3647,6 +3653,35 @@ mod tests {
         assert!(runtime.content_write_lock.try_lock().is_ok());
         runtime.resize(12, 50, 0, 0);
         assert_eq!(runtime.current_size.get(), (12, 50, 0, 0));
+    }
+
+    /// With a raw tap the model must stay a pure function of the byte
+    /// stream: a resize is exactly libghostty's reflow, with no recovery
+    /// text written back that the tap client never received.
+    #[tokio::test]
+    async fn resize_with_a_raw_tap_matches_a_bare_terminal_resize() {
+        let screen = b"line1\r\nline2\r\nline3\r\n";
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, screen);
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw("1-0".into(), tx, Arc::new(RawTapBudget::new(1 << 20)), true);
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        let _ = rx.try_iter().count();
+
+        // Growing the screen leaves the bottom blank, which is exactly when
+        // the recovery replay would rewrite recent lines into the model.
+        runtime.resize(40, 20, 0, 0);
+
+        let mut bare = crate::ghostty::Terminal::new(20, 5, 10_000).expect("terminal");
+        bare.write(screen);
+        bare.resize(20, 40, 0, 0).expect("resize");
+        assert_eq!(
+            runtime.terminal.ghostty.recent_text_raw(40),
+            super::terminal::recent_text_for_test(&bare, 40)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a resize publishes nothing to the tap"
+        );
     }
 
     #[test]

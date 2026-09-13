@@ -314,3 +314,127 @@ async fn control_methods_need_an_open_stream() {
         serde_json::from_str(&response_rx.recv().expect("response")).expect("json");
     assert_eq!(response["error"]["code"], "control_stream_required");
 }
+
+fn open_control(
+    server: &mut HeadlessServer,
+) -> (
+    ControlConnectionHandle,
+    std::sync::mpsc::Receiver<ControlOutbound>,
+) {
+    let (outbound_tx, outbound_rx) = std::sync::mpsc::channel();
+    let handle = ControlConnectionHandle::new(outbound_tx);
+    let opened = send_control(server, &handle, Method::ControlOpen(Default::default()))
+        .expect("open response");
+    assert_eq!(opened["result"]["type"], "control_opened");
+    (handle, outbound_rx)
+}
+
+fn set_tab_geometry(
+    server: &mut HeadlessServer,
+    handle: &ControlConnectionHandle,
+    tab_id: &str,
+    cols: u16,
+    rows: u16,
+) {
+    let resized = send_control(
+        server,
+        handle,
+        Method::TabSetGeometry(TabSetGeometryParams {
+            tab_id: tab_id.to_owned(),
+            cols,
+            rows,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            chrome: TabChrome::None,
+        }),
+    )
+    .expect("geometry response");
+    assert_eq!(
+        resized["result"]["type"], "ok",
+        "geometry failed: {resized}"
+    );
+}
+
+/// With only control connections attached, the render loop lays herdr's
+/// own view out at the headless size. A tab a control connection sized must
+/// keep that size, and no `tab.layout` record may be emitted for it.
+#[tokio::test]
+async fn no_client_render_keeps_control_owned_tab_geometry() {
+    let mut server = test_headless_server();
+    let _input_rx = install_focused_test_runtime(&mut server, b"hello\r\n");
+    let tab_id = server
+        .app
+        .session_snapshot()
+        .focused_tab_id
+        .expect("focused tab");
+    let (handle, outbound_rx) = open_control(&mut server);
+    set_tab_geometry(&mut server, &handle, &tab_id, 120, 40);
+    assert_eq!(focused_runtime(&server).current_size(), (40, 120));
+    assert!(server.app.state.control_geometry_tabs.contains(&tab_id));
+    let _ = outbound_rx.try_iter().count();
+
+    assert!(server.app.state.view.pane_infos.is_empty());
+    server.render_and_stream();
+
+    assert_eq!(focused_runtime(&server).current_size(), (40, 120));
+    assert!(
+        outbound_rx.try_iter().all(|record| !matches!(
+            record,
+            ControlOutbound::Line(ref line) if line.contains("tab.layout")
+        )),
+        "a view recompute must not resize a control-owned tab"
+    );
+
+    let closed = send_control(
+        &mut server,
+        &handle,
+        Method::ControlClose(Default::default()),
+    )
+    .expect("close response");
+    assert_eq!(closed["result"]["type"], "ok");
+    assert!(server.app.state.control_geometry_tabs.is_empty());
+}
+
+/// A herdr shell client resizing its window and a layout action recomputing
+/// the view both resize background tabs; a control-owned one is skipped.
+#[tokio::test]
+async fn shell_client_and_layout_recompute_keep_control_owned_background_tab_geometry() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("control-owned-background");
+    let first_pane = workspace.tabs[0].root_pane;
+    let second_tab = workspace.test_add_tab(Some("second"));
+    let second_pane = workspace.tabs[second_tab].root_pane;
+    workspace.insert_test_runtime(
+        first_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"FIRST_TAB"),
+    );
+    workspace.insert_test_runtime(
+        second_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"SECOND_TAB"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
+    let size_of = |server: &HeadlessServer, pane| {
+        server.app.state.workspaces[0].test_runtimes[&pane].current_size()
+    };
+
+    let (handle, _outbound_rx) = open_control(&mut server);
+    set_tab_geometry(&mut server, &handle, &second_tab_id, 120, 40);
+    assert_eq!(size_of(&server, second_pane), (40, 120));
+
+    let (first_control, _first_render) = connect_test_shell(&mut server, 21, 100, 30);
+    let _ = first_control.recv().expect("first snapshot");
+    assert_ne!(size_of(&server, first_pane), (24, 80));
+    assert_eq!(size_of(&server, second_pane), (40, 120));
+
+    crate::ui::compute_view_with_runtime_registry(
+        &mut server.app.state,
+        &server.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 60, 20),
+    );
+    assert_ne!(size_of(&server, first_pane), (40, 120));
+    assert_eq!(size_of(&server, second_pane), (40, 120));
+}

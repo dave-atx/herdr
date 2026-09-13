@@ -73,6 +73,7 @@ impl HeadlessServer {
         } else {
             self.tab_geometry_controllers
                 .retain(|_, controller_id| *controller_id != client_id);
+            self.sync_control_geometry_tabs();
             if self.foreground_client_id == Some(client_id) {
                 self.promote_latest_remaining_client();
                 self.resize_shared_runtime_to_effective_size_with_pending_agent_resumes(true);

@@ -209,6 +209,7 @@ impl HeadlessServer {
             .collect::<Vec<_>>();
         self.tab_geometry_controllers
             .retain(|_, controller| *controller != connection_id);
+        self.sync_control_geometry_tabs();
         for tab_id in owned {
             self.app.state.control_chromeless_tabs.remove(&tab_id);
         }
@@ -623,6 +624,7 @@ impl HeadlessServer {
             .insert(params.tab_id.clone(), (params.cols, params.rows, cell_size));
         self.tab_geometry_controllers
             .insert(params.tab_id.clone(), connection_id);
+        self.sync_control_geometry_tabs();
         match params.chrome {
             api::schema::TabChrome::None => {
                 self.app
@@ -787,6 +789,17 @@ impl HeadlessServer {
         self.control_connections
             .get(&controller_id)?
             .tab_geometry(&tab_id)
+    }
+
+    /// Mirrors control-owned claims into `AppState` for `crate::ui`. Call
+    /// after every mutation of `tab_geometry_controllers`.
+    pub(super) fn sync_control_geometry_tabs(&mut self) {
+        self.app.state.control_geometry_tabs = self
+            .tab_geometry_controllers
+            .iter()
+            .filter(|(_, controller)| is_control_connection_id(**controller))
+            .map(|(tab_id, _)| tab_id.clone())
+            .collect();
     }
 
     pub(super) fn control_connection_holds_tab(&self, controller_id: u64, tab_id: &str) -> bool {
