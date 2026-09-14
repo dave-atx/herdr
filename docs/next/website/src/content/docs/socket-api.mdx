@@ -840,32 +840,58 @@ A control stream is one connection a client keeps open to drive Herdr the way a
 terminal emulator would. It multiplexes ordinary requests, event subscriptions,
 and raw terminal output for panes the client renders itself. Servers that
 support it advertise `terminal_control_stream` in `ping` capabilities
-(currently `1`), and `herdr control` bridges one to stdin and stdout so an SSH
-exec channel can carry it without a PTY.
+(currently `2`) together with `control_features`, a list of feature names a
+client should gate on rather than the number alone: `shared_attach`,
+`geometry_ownership`, `geometry_controller`, `control_list`, `client_identity`,
+`query_authority`, `event_drain`, `event_gap`, and `auto_input`. `herdr control`
+bridges one stream to stdin and stdout so an SSH exec channel can carry it
+without a PTY.
 
 Open the stream with `control.open` as the first request on a fresh connection.
-The response reports the server `boot_id`, `connection_id`, version, protocol,
-and capabilities. Every later line on the connection is a request; responses,
-pushed subscription events, and terminal records share the socket in one order.
-`events.subscribe` adds subscriptions to the same connection instead of taking
-it over, and `ping` answers locally. Blocking helpers (`events.wait`,
-`agent.wait`, `agent.prompt`, `pane.wait_for_output`) and `pane.graphics.stream`
-are refused with `unsupported_in_control_stream`; use a separate connection for
-them. `control.close`, or closing the connection, releases everything the stream
+The optional `client` object names the caller (`name`, `version`) and the
+highest control protocol it speaks (`protocol`); the server negotiates down and
+reports the result as `control_protocol` next to the server `boot_id`,
+`connection_id`, version, protocol, and capabilities. A `control.open` without
+`client` gets protocol 1, the original contract: one owner per terminal and no
+records the client does not know. `herdr control` fills `client` from
+`HERDR_CONTROL_CLIENT` (`name/version`) and `HERDR_CONTROL_PROTOCOL` (unset
+means protocol 1; with neither set it sends no `client` at all). Every
+later line on the connection is a request; responses, pushed subscription
+events, and terminal records share the socket in one order. `events.subscribe`
+adds subscriptions to the same connection instead of taking it over, and every
+pending event is delivered per poll, not one; when the event ring dropped
+events before the stream read them, protocol 2 streams get an `events.gap`
+record with `dropped` and the `resume_sequence` delivery continues from.
+`ping` answers locally. Blocking helpers (`events.wait`, `agent.wait`,
+`agent.prompt`, `pane.wait_for_output`) and `pane.graphics.stream` are refused
+with `unsupported_in_control_stream`; use a separate connection for them.
+`control.close`, or closing the connection, releases everything the stream
 owned.
 
 ```json
-{"id":"c","method":"control.open","params":{}}
+{"id":"c","method":"control.open","params":{"client":{"name":"rootshell","version":"1.0.13","protocol":2}}}
 {"id":"a","method":"terminal.attach","params":{"target":"w1:p1","answer_queries":"client","history_limit_bytes":1048576}}
-{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16}}
+{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16,"chrome":"none"}}
+{"id":"h","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":100,"rows":30,"cell_width_px":8,"cell_height_px":16,"chrome":"none","claim":false}}
+{"id":"k","method":"tab.claim_geometry","params":{"tab_id":"w1:t1"}}
 {"id":"i","method":"terminal.input","params":{"attach_id":"1-0","bytes":"bHMK"}}
 {"id":"s","method":"terminal.snapshot","params":{"attach_id":"1-0"}}
+{"id":"l","method":"control.list","params":{}}
 {"id":"d","method":"terminal.detach","params":{"attach_id":"1-0"}}
 ```
 
-`terminal.attach` takes a pane id, terminal id, or agent name and makes the
-stream the writable owner of that terminal, like a direct attach; pass
-`takeover: true` to evict another owner. The response carries the `attach_id`,
+`terminal.attach` takes a pane id, terminal id, or agent name. Attaches that
+follow the tab layout (the default `geometry: "tab"`) share a terminal: any
+number of streams, and several attaches on one stream, can hold the same pane
+at once, each with its own snapshot and output sequence, and input from each
+reaches the PTY. A size owner cannot share: a direct `herdr attach` client or
+an attach with `geometry: "terminal"` is refused with `terminal_attached` while
+anything else holds the terminal, and a tab follower is refused while a size
+owner holds it. `takeover: true` evicts whatever blocks the attach. From a tab
+follower it also evicts followers on protocol 1 streams, which expect
+exclusive ownership; protocol 2 followers are never evicted by another
+follower. The evicted side sees `terminal.detached` with reason `takeover`.
+The attach response carries the `attach_id`,
 and the first record for it is `terminal.snapshot`: the active screen as ANSI
 (`primary` with unwrapped scrollback, or `alternate`), `state_ansi` with the
 sequences that restore terminal state (modes, scrolling region, tab stops,
@@ -887,32 +913,69 @@ a client falls behind, the server drops output and sends `terminal.gap`;
 request `terminal.snapshot` to resynchronize, which emits a fresh
 `terminal.snapshot` stamped with the current `seq`. `terminal.input` writes
 bytes to the PTY verbatim, including bracketed-paste wrappers and the mouse or
-focus reports the client's emulator produced. `terminal.detached` reports
-`takeover` or `closed`. The record shapes are in the bundled schema under
+focus reports the client's emulator produced. Replies the client's emulator
+generates on its own (device attributes, cursor position, colour queries)
+should carry `"auto": true`: the server forwards them only from the attach
+that currently answers queries, drops them from every other attach so the
+application never sees duplicates, and never treats them as interaction, so
+they cannot claim a tab's geometry. An attach that lost authority within the
+last two seconds still delivers, so a query answered across a hand-off is
+not lost. `terminal.detached` reports `takeover` or
+`closed`. The record shapes are in the bundled schema under
 `schemas.control_record`.
 
 `answer_queries` decides which emulator answers device attributes, XTGETTCAP,
-and OSC color queries. With `client` (the default) Herdr suppresses its own
-replies while the attach owns the terminal, so exactly one emulator answers;
-with `server` Herdr answers as usual.
+and OSC color queries. With `client` (the default) the attach asks to answer;
+with `server` Herdr answers as usual. Exactly one attach per terminal answers
+at a time: a protocol 1 attach first (it cannot be told to stop), otherwise the
+attach on the stream that owns the tab's geometry, otherwise the oldest
+client-authority attach. Herdr suppresses its own replies while that attach is
+armed. Protocol 2 streams learn their standing from `terminal.authority`
+records (`attach_id`, `answers_queries`): one after each attach snapshot and
+one whenever it changes. `control.list` reports it as `answers_queries` too.
 
-Sizes follow the tab layout by default: claim a tab with `tab.set_geometry` and
-Herdr lays the tab out in the claimed area. Pass `chrome: "none"` to lay the
-tab out without Herdr's borders, gaps, and scrollbar gutters, so the pane
-rectangles tile the area exactly and the client draws its own dividers; the
-default `server` keeps the configured chrome. Every geometry change while a
-control stream is open, whichever client caused it, sends a `tab.layout` record
-on the stream before the terminals are resized. It carries the tab's
-`PaneLayoutSnapshot` with each pane's rectangle set to the inner area its
-terminal is sized to, after borders, gutters, and zoom. Because the record
-shares the ordered lane with `terminal.output`, a client always has the new
-rectangles before any redraw drawn at the new size. `session.snapshot` layouts
-use the server's shared view area and outer pane rectangles, so treat them as
-topology until the first `tab.layout` for a tab arrives. The claim follows the
-same rules as a Herdr client viewing the tab, so the last client to interact
-wins. An attach with `geometry: "terminal"` instead sizes one terminal with
-`terminal.resize` and locks the tab layout out of it; when it detaches, the
-tab's geometry controller sizes the terminal again.
+Sizes follow the tab layout by default. `tab.set_geometry` stores the size and
+chrome a stream wants for a tab and, with `claim: true` (the default), makes
+the stream the tab's geometry controller and lays the tab out in that area.
+Pass `chrome: "none"` to lay the tab out without Herdr's borders, gaps, and
+scrollbar gutters, so the pane rectangles tile the area exactly and the client
+draws its own dividers; the default `server` keeps the configured chrome. With
+`claim: false` the size is only stored: nothing is laid out unless the stream
+already owns the tab, in which case the new size applies. A stream that stored
+a size takes the tab later with `tab.claim_geometry` (`tab_id`, or `attach_id`
+to name the tab through an attach; `no_geometry` when nothing is stored), and
+takes it implicitly the first time it sends `terminal.input` to a pane in that
+tab while someone else owns it, once per change of ownership. The claim's
+`tab.layout` record precedes the echo on the lane. Focus requests never claim
+geometry, so selecting or copying from a pane does not resize it. The last
+stream to claim or type therefore wins, matching the rule for Herdr clients
+viewing the tab. When the owning stream closes, the tab passes to the
+remaining stream that most recently claimed or typed on it and stored a size,
+otherwise back to the viewing Herdr clients.
+
+Every geometry change while a control stream is open, whichever client caused
+it, sends a `tab.layout` record to every stream before the terminals are
+resized. It carries the tab's `PaneLayoutSnapshot` with each pane's rectangle
+set to the inner area its terminal is sized to, after borders, gutters, and
+zoom, plus `geometry_controller`: `kind` (`control`, `client`, or `none`), the
+`connection_id` that owns the tab, and the `chrome` in force. A stream that is
+not the controller renders that layout as it is. `session.snapshot`, `tab.get`,
+and `layout.updated` layouts carry `geometry_controller` too; their areas use
+the server's shared view, so treat them as topology until the first
+`tab.layout` for a tab arrives. Subscribe to `tab.geometry_changed` to hear
+ownership move: the event carries `tab_id`, `workspace_id`, the new
+`geometry_controller`, and `previous`. Note that `tab.focus` and `pane.focus`
+from a control stream still move Herdr's global focus, the same as from any
+API client. An attach with `geometry: "terminal"` instead sizes one terminal
+with `terminal.resize` and locks the tab layout out of it; when it detaches,
+the tab's geometry controller sizes the terminal again.
+
+`control.list` works on any connection and returns every open control stream:
+`connection_id`, `control_protocol`, the `client` it declared, its `attaches`
+(`attach_id`, `terminal_id`, `pane_id`, `geometry`, `answer_queries`,
+`answers_queries`), and the `tabs` it stored sizes for (`cols`, `rows`, cell
+pixels, `chrome`, and `controller` for the ones it owns). On a control stream
+the result also names `self_connection_id`.
 
 ## Reading panes
 

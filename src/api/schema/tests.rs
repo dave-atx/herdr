@@ -381,12 +381,14 @@ fn control_stream_requests_round_trip() {
             cell_width_px: 8,
             cell_height_px: 16,
             chrome: TabChrome::None,
+            claim: false,
         }),
     };
     let json = serde_json::to_value(&geometry).unwrap();
     assert_eq!(json["method"], "tab.set_geometry");
     assert_eq!(json["params"]["cols"], 120);
     assert_eq!(json["params"]["chrome"], "none");
+    assert_eq!(json["params"]["claim"], false);
     let bare: Request = serde_json::from_str(
         r#"{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40}}"#,
     )
@@ -395,6 +397,108 @@ fn control_stream_requests_round_trip() {
         panic!("expected tab.set_geometry");
     };
     assert_eq!(params.chrome, TabChrome::Server);
+    assert!(
+        params.claim,
+        "claim defaults to true for protocol 1 clients"
+    );
+
+    let open: Request = serde_json::from_str(
+        r#"{"id":"c","method":"control.open","params":{"client":{"name":"rootshell","version":"1.0.13","protocol":2}}}"#,
+    )
+    .unwrap();
+    let Method::ControlOpen(params) = &open.method else {
+        panic!("expected control.open");
+    };
+    let client = params.client.as_ref().expect("client");
+    assert_eq!(client.name, "rootshell");
+    assert_eq!(client.protocol, 2);
+    assert_eq!(
+        serde_json::to_value(&open).unwrap()["params"]["client"]["version"],
+        "1.0.13"
+    );
+
+    let typed: Request = serde_json::from_str(
+        r#"{"id":"i","method":"terminal.input","params":{"attach_id":"0-0","bytes":"bHMK"}}"#,
+    )
+    .unwrap();
+    let Method::TerminalInput(params) = &typed.method else {
+        panic!("expected terminal.input");
+    };
+    assert!(!params.auto, "input is a keystroke unless flagged");
+    assert!(
+        serde_json::to_value(&typed).unwrap()["params"]
+            .get("auto")
+            .is_none(),
+        "protocol 1 clients never see the flag echoed"
+    );
+    let reply: Request = serde_json::from_str(
+        r#"{"id":"i","method":"terminal.input","params":{"attach_id":"0-0","bytes":"G1s/MTsyYw==","auto":true}}"#,
+    )
+    .unwrap();
+    let Method::TerminalInput(params) = &reply.method else {
+        panic!("expected terminal.input");
+    };
+    assert!(params.auto);
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap()["params"]["auto"],
+        true
+    );
+
+    let claim: Request = serde_json::from_str(
+        r#"{"id":"k","method":"tab.claim_geometry","params":{"tab_id":"w1:t1"}}"#,
+    )
+    .unwrap();
+    let Method::TabClaimGeometry(params) = &claim.method else {
+        panic!("expected tab.claim_geometry");
+    };
+    assert_eq!(params.tab_id.as_deref(), Some("w1:t1"));
+    assert!(params.attach_id.is_none());
+
+    let list: Request =
+        serde_json::from_str(r#"{"id":"l","method":"control.list","params":{}}"#).unwrap();
+    assert!(matches!(list.method, Method::ControlList(_)));
+    let list_result = SuccessResponse {
+        id: "l".into(),
+        result: ResponseResult::ControlList {
+            self_connection_id: Some(1 << 40),
+            connections: vec![ControlConnectionInfo {
+                connection_id: 1 << 40,
+                control_protocol: 2,
+                client: Some(ControlClientInfo {
+                    name: "rootshell".into(),
+                    version: "1.0.13".into(),
+                    protocol: 2,
+                }),
+                attaches: vec![ControlAttachInfo {
+                    attach_id: "0-0".into(),
+                    terminal_id: "t1".into(),
+                    pane_id: Some("w1:p1".into()),
+                    geometry: TerminalAttachGeometry::Tab,
+                    answer_queries: TerminalQueryAuthority::Client,
+                    answers_queries: true,
+                }],
+                tabs: vec![ControlTabInfo {
+                    tab_id: "w1:t1".into(),
+                    cols: 120,
+                    rows: 40,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                    chrome: TabChrome::None,
+                    controller: true,
+                }],
+            }],
+        },
+    };
+    let json = serde_json::to_value(&list_result).unwrap();
+    assert_eq!(json["result"]["type"], "control_list");
+    assert_eq!(
+        json["result"]["connections"][0]["tabs"][0]["controller"],
+        true
+    );
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        list_result
+    );
 }
 
 #[test]
@@ -419,6 +523,47 @@ fn control_records_use_dotted_type_tags() {
     let json = serde_json::to_value(&detached).unwrap();
     assert_eq!(json["type"], "terminal.detached");
     assert_eq!(json["reason"], "takeover");
+
+    let authority = ControlRecord::Authority {
+        attach_id: "1-0".into(),
+        answers_queries: true,
+    };
+    let json = serde_json::to_value(&authority).unwrap();
+    assert_eq!(json["type"], "terminal.authority");
+    assert_eq!(json["answers_queries"], true);
+    assert_eq!(
+        serde_json::from_value::<ControlRecord>(json).unwrap(),
+        authority
+    );
+
+    let gap = ControlRecord::EventsGap {
+        dropped: 37,
+        resume_sequence: 9120,
+    };
+    let json = serde_json::to_value(&gap).unwrap();
+    assert_eq!(json["type"], "events.gap");
+    assert_eq!(json["resume_sequence"], 9120);
+    assert_eq!(serde_json::from_value::<ControlRecord>(json).unwrap(), gap);
+
+    let layout: ControlRecord = serde_json::from_str(
+        r#"{"type":"tab.layout","layout":{"workspace_id":"w1","tab_id":"w1:t1","zoomed":false,
+        "area":{"x":0,"y":0,"width":80,"height":24},"focused_pane_id":"w1:p1","panes":[],"splits":[],
+        "geometry_controller":{"kind":"control","connection_id":1099511627776,"chrome":"none"}}}"#,
+    )
+    .unwrap();
+    let ControlRecord::TabLayout { layout } = layout else {
+        panic!("expected tab.layout");
+    };
+    let controller = layout.geometry_controller.expect("controller");
+    assert_eq!(controller.kind, GeometryControllerKind::Control);
+    assert_eq!(controller.connection_id, Some(1 << 40));
+    assert_eq!(controller.chrome, TabChrome::None);
+    let bare: PaneLayoutSnapshot = serde_json::from_str(
+        r#"{"workspace_id":"w1","tab_id":"w1:t1","zoomed":false,"area":{"x":0,"y":0,"width":80,"height":24},
+        "focused_pane_id":"w1:p1","panes":[],"splits":[]}"#,
+    )
+    .unwrap();
+    assert!(bare.geometry_controller.is_none());
 }
 
 #[test]
@@ -664,7 +809,25 @@ fn event_envelope_round_trips() {
                         },
                     }],
                     splits: vec![],
+                    geometry_controller: Some(GeometryController {
+                        kind: GeometryControllerKind::Control,
+                        connection_id: Some(1 << 40),
+                        chrome: TabChrome::None,
+                    }),
                 },
+            },
+        },
+        EventEnvelope {
+            event: EventKind::TabGeometryChanged,
+            data: EventData::TabGeometryChanged {
+                tab_id: "w_1:1".into(),
+                workspace_id: "w_1".into(),
+                geometry_controller: GeometryController {
+                    kind: GeometryControllerKind::Client,
+                    connection_id: Some(3),
+                    chrome: TabChrome::Server,
+                },
+                previous: Some(GeometryController::default()),
             },
         },
     ];
@@ -799,7 +962,8 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
-                terminal_control_stream: 0,
+                terminal_control_stream: 2,
+                control_features: vec!["shared_attach".into()],
                 server_pid: None,
             }),
         },

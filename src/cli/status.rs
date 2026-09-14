@@ -283,6 +283,7 @@ struct ServerCapabilitiesJson {
     surface_interest: bool,
     health_check: bool,
     terminal_control_stream: u32,
+    control_features: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -327,6 +328,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
                     terminal_control_stream: capabilities.terminal_control_stream,
+                    control_features: capabilities.control_features.clone(),
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
@@ -419,6 +421,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 terminal_control_stream: 0,
+                control_features: Vec::new(),
                 server_pid: None,
             }),
         }

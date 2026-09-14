@@ -309,6 +309,15 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        /// Control stream protocol negotiated for this connection.
+        #[serde(default)]
+        control_protocol: u32,
+    },
+    /// Open control streams and what they hold.
+    ControlList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        self_connection_id: Option<u64>,
+        connections: Vec<super::terminal::ControlConnectionInfo>,
     },
     /// A raw terminal attach is live; its `terminal.snapshot` record follows.
     TerminalAttached {

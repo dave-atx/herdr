@@ -48,6 +48,8 @@ pub enum Subscription {
     TabRenamed {},
     #[serde(rename = "tab.moved")]
     TabMoved {},
+    #[serde(rename = "tab.geometry_changed")]
+    TabGeometryChanged {},
     #[serde(rename = "pane.created")]
     PaneCreated {},
     #[serde(rename = "pane.closed")]
@@ -208,6 +210,7 @@ pub enum EventKind {
     TabRenamed,
     TabMoved,
     TabFocused,
+    TabGeometryChanged,
     PaneCreated,
     PaneClosed,
     PaneUpdated,
@@ -239,6 +242,7 @@ impl EventKind {
             EventKind::TabRenamed => "tab.renamed",
             EventKind::TabMoved => "tab.moved",
             EventKind::TabFocused => "tab.focused",
+            EventKind::TabGeometryChanged => "tab.geometry_changed",
             EventKind::PaneCreated => "pane.created",
             EventKind::PaneClosed => "pane.closed",
             EventKind::PaneUpdated => "pane.updated",
@@ -271,6 +275,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::TabRenamed,
     EventKind::TabMoved,
     EventKind::TabFocused,
+    EventKind::TabGeometryChanged,
     EventKind::PaneCreated,
     EventKind::PaneClosed,
     EventKind::PaneUpdated,
@@ -552,5 +557,12 @@ pub enum EventData {
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
+    },
+    TabGeometryChanged {
+        tab_id: String,
+        workspace_id: String,
+        geometry_controller: super::panes::GeometryController,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<super::panes::GeometryController>,
     },
 }

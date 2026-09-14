@@ -16,8 +16,8 @@ use tracing::debug;
 
 use crate::api::control::{ControlConnectionHandle, ControlOutbound};
 use crate::api::schema::{
-    ControlRecord, EmptyParams, ErrorBody, ErrorResponse, Method, Request, ResponseResult,
-    ServerCapabilities, SuccessResponse,
+    ControlOpenParams, ControlRecord, EmptyParams, ErrorBody, ErrorResponse, Method, Request,
+    ResponseResult, ServerCapabilities, SuccessResponse, TabClaimGeometryParams,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::{ApiRequestSender, EventHub};
@@ -37,6 +37,7 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 pub(super) fn serve(
     mut stream: LocalStream,
     request_id: String,
+    params: ControlOpenParams,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -48,7 +49,7 @@ pub(super) fn serve(
     let opened = dispatch_to_app_with_control(
         Request {
             id: request_id,
-            method: Method::ControlOpen(Default::default()),
+            method: Method::ControlOpen(params),
         },
         api_tx,
         handle.clone(),
@@ -90,13 +91,30 @@ pub(super) fn serve(
         let event_hub = event_hub.clone();
         let running = Arc::clone(running);
         std::thread::spawn(move || {
-            while handle.is_alive() && running.load(Ordering::Relaxed) {
+            // Every subscription reports the same ring gap; announce it once.
+            let mut announced_gap = None;
+            'poll: while handle.is_alive() && running.load(Ordering::Relaxed) {
                 if let Ok(mut subscriptions) = subscriptions.lock() {
                     for subscription in subscriptions.iter_mut() {
-                        if let Some(event) = subscription.poll(&api_tx, &event_hub) {
+                        let (events, gap) = subscription.poll_batch(&api_tx, &event_hub);
+                        if let Some(gap) = gap {
+                            if handle.protocol() >= 2 && announced_gap != Some(gap.resume_sequence)
+                            {
+                                announced_gap = Some(gap.resume_sequence);
+                                let record = ControlRecord::EventsGap {
+                                    dropped: gap.dropped,
+                                    resume_sequence: gap.resume_sequence,
+                                };
+                                if !handle.send_line(encode_record(&record)) {
+                                    handle.close();
+                                    break 'poll;
+                                }
+                            }
+                        }
+                        for event in events {
                             if !handle.send_line(event.to_string()) {
                                 handle.close();
-                                break;
+                                break 'poll;
                             }
                         }
                     }
@@ -181,6 +199,13 @@ fn writer_loop(
             ControlOutbound::Detached { attach_id, reason } => {
                 encode_record(&ControlRecord::Detached { attach_id, reason })
             }
+            ControlOutbound::Authority {
+                attach_id,
+                answers_queries,
+            } => encode_record(&ControlRecord::Authority {
+                attach_id,
+                answers_queries,
+            }),
         };
         if let Err(err) = write_text_line(&mut stream, &line) {
             debug!(err = %err, "control stream write failed");
@@ -378,7 +403,7 @@ fn handle_request_line(
         Method::EventsSubscribe(params) => {
             subscribe(&request_id, params, api_tx, event_hub, subscriptions)
         }
-        Method::TerminalInput(params) => terminal_input(handle, request_id.clone(), params),
+        Method::TerminalInput(params) => terminal_input(handle, api_tx, request_id.clone(), params),
         Method::EventsWait(_) => unsupported(request_id.clone(), "events.wait"),
         Method::AgentPrompt(_) => unsupported(request_id.clone(), "agent.prompt"),
         Method::AgentWait(_) => unsupported(request_id.clone(), "agent.wait"),
@@ -473,8 +498,9 @@ fn subscribe(
     .unwrap_or_else(|_| "{}".to_string())
 }
 
-fn terminal_input(
+pub(crate) fn terminal_input(
     handle: &ControlConnectionHandle,
+    api_tx: &ApiRequestSender,
     request_id: String,
     params: crate::api::schema::TerminalInputParams,
 ) -> String {
@@ -488,13 +514,40 @@ fn terminal_input(
             );
         }
     };
-    let Some(sink) = handle.input_sink(&params.attach_id) else {
+    let Some((sink, is_authority)) = handle.input_sink_with_authority(&params.attach_id) else {
         return error_response_json(
             request_id,
             "unknown_attach",
             format!("attach {} is not live", params.attach_id),
         );
     };
+    // An emulator's own reply is not interaction, and only the query
+    // authority's reply reaches the application; the rest would duplicate
+    // it. An attach that lost authority moments ago still delivers, so a
+    // query answered across a hand-off is never lost.
+    if params.auto {
+        if !is_authority {
+            return serde_json::to_string(&SuccessResponse {
+                id: request_id,
+                result: ResponseResult::Ok {},
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+        }
+    } else if handle.take_claim_on_input(&params.attach_id) {
+        // Typing into a tab someone else sizes takes it, once per ownership
+        // change: the claim's `tab.layout` lands on the lane before the echo.
+        let _ = dispatch_to_app_with_control(
+            Request {
+                id: format!("{request_id}:claim"),
+                method: Method::TabClaimGeometry(TabClaimGeometryParams {
+                    tab_id: None,
+                    attach_id: Some(params.attach_id.clone()),
+                }),
+            },
+            api_tx,
+            handle.clone(),
+        );
+    }
     match sink.try_send(bytes::Bytes::from(bytes)) {
         Ok(()) => serde_json::to_string(&SuccessResponse {
             id: request_id,

@@ -30,6 +30,10 @@ pub struct ServerCapabilities {
     /// Control stream protocol supported by this server; 0 when unsupported.
     #[serde(default)]
     pub terminal_control_stream: u32,
+    /// Control stream features by name; clients gate on these, not on the
+    /// protocol number alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_features: Vec<String>,
     /// Process id of the server, for clients that key state on a server instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_pid: Option<u32>,

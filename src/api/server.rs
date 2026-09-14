@@ -22,7 +22,7 @@ use crate::ipc::{
     socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
-mod control_stream;
+pub(crate) mod control_stream;
 mod pane_graphics_stream;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -73,6 +73,10 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         terminal_control_stream: crate::api::control::CONTROL_STREAM_PROTOCOL,
+        control_features: crate::api::control::CONTROL_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect(),
         server_pid: Some(std::process::id()),
     })
 }
@@ -216,10 +220,11 @@ fn handle_connection_with_stop(
             }
             result
         }
-        Method::ControlOpen(_) => {
+        Method::ControlOpen(params) => {
             let result = control_stream::serve(
                 stream,
                 request_id.clone(),
+                params,
                 api_tx,
                 event_hub,
                 running,
@@ -524,6 +529,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::TerminalSnapshot(_) => "terminal.snapshot",
         Method::TerminalResize(_) => "terminal.resize",
         Method::TabSetGeometry(_) => "tab.set_geometry",
+        Method::TabClaimGeometry(_) => "tab.claim_geometry",
+        Method::ControlList(_) => "control.list",
     }
 }
 
@@ -1212,6 +1219,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 terminal_control_stream: 0,
+                control_features: Vec::new(),
                 server_pid: None,
             }),
             None,

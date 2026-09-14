@@ -46,6 +46,28 @@ installer or package manager, then restart the server after saving work.
 Merging the feature upstream does not automatically migrate fork users. We will
 announce an official version containing the feature and migration instructions.
 
+## Control protocol 2
+
+Fork releases from this version advertise `terminal_control_stream: 2` and a
+`control_features` list in `ping` and `control.open` capabilities. Clients gate
+on the feature names, not the number: `shared_attach` (several streams hold one
+pane), `geometry_ownership` (`tab.set_geometry` with `claim`, `tab.claim_geometry`,
+input claims), `geometry_controller` (layouts name the tab's owner and
+`tab.geometry_changed` reports changes), `control_list`, `client_identity`
+(`control.open` takes a `client` object), `query_authority` (`terminal.authority`
+records), `event_drain`, `event_gap`, and `auto_input` (`terminal.input` with
+`auto: true` for the emulator's own replies: forwarded only from the query
+authority, never a geometry claim).
+
+A client opts in by sending `client.protocol: 2` on `control.open`; `herdr
+control` reads it from `HERDR_CONTROL_PROTOCOL` and the label from
+`HERDR_CONTROL_CLIENT`. Streams that send nothing keep protocol 1: their
+`takeover: true` attaches still evict other protocol 1 attaches, they answer
+terminal queries first, and they never receive records added since. Protocol 1
+and 2 clients share a server; a protocol 1 takeover does not evict protocol 2
+attaches. The socket API reference under `docs/next/website` describes the
+wire shapes.
+
 ## Publishing
 
 Push an immutable `rootshell-vMAJOR.MINOR.PATCH` tag to `kitknox/herdr`. The

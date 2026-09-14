@@ -7,7 +7,70 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
-pub struct ControlOpenParams {}
+pub struct ControlOpenParams {
+    /// Who is opening the stream. Absent for protocol 1 clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ControlClientInfo>,
+}
+
+/// Identity a control client declares on `control.open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct ControlClientInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    /// Highest control stream protocol the client speaks; the server
+    /// negotiates down to what it supports.
+    #[serde(default)]
+    pub protocol: u32,
+}
+
+/// `tab.claim_geometry`: take a tab's geometry with the size this stream
+/// stored for it. `attach_id` names the tab through an attach instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct TabClaimGeometryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_id: Option<String>,
+}
+
+/// One open control stream, as `control.list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ControlConnectionInfo {
+    pub connection_id: u64,
+    pub control_protocol: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ControlClientInfo>,
+    pub attaches: Vec<ControlAttachInfo>,
+    pub tabs: Vec<ControlTabInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ControlAttachInfo {
+    pub attach_id: String,
+    pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    pub geometry: TerminalAttachGeometry,
+    pub answer_queries: TerminalQueryAuthority,
+    /// Whether this attach is the one emulator answering the pane's queries.
+    pub answers_queries: bool,
+}
+
+/// A tab a control stream stored a size for. `controller` is true while the
+/// stream owns the tab's geometry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ControlTabInfo {
+    pub tab_id: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+    pub chrome: TabChrome,
+    pub controller: bool,
+}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
@@ -83,6 +146,11 @@ pub struct TerminalInputParams {
     pub attach_id: String,
     /// Base64 bytes written to the PTY verbatim.
     pub bytes: String,
+    /// The client's emulator answered a query (DA, CPR, colours) rather
+    /// than the user typing: forwarded only from the query authority and
+    /// never counted as interaction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -109,6 +177,14 @@ pub struct TabSetGeometryParams {
     /// scrollbar gutters, or hands the client bare pane rectangles.
     #[serde(default)]
     pub chrome: TabChrome,
+    /// Take the tab's geometry now (the default). With `false` the size is
+    /// only stored, for a later `tab.claim_geometry` or input-driven claim.
+    #[serde(default = "default_true")]
+    pub claim: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Layout chrome for a tab a control stream sizes.
@@ -238,6 +314,17 @@ pub enum ControlRecord {
     TabLayout {
         layout: super::panes::PaneLayoutSnapshot,
     },
+    /// Whether this attach now answers the pane's terminal queries. Sent
+    /// only on control protocol 2 and later.
+    #[serde(rename = "terminal.authority")]
+    Authority {
+        attach_id: String,
+        answers_queries: bool,
+    },
+    /// Subscription events were lost because the stream fell behind; the
+    /// next event delivered has sequence `resume_sequence`. Protocol 2+.
+    #[serde(rename = "events.gap")]
+    EventsGap { dropped: u64, resume_sequence: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

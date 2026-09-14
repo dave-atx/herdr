@@ -1228,7 +1228,9 @@ impl App {
             | Method::TerminalInput(_)
             | Method::TerminalSnapshot(_)
             | Method::TerminalResize(_)
-            | Method::TabSetGeometry(_) => {
+            | Method::TabSetGeometry(_)
+            | Method::TabClaimGeometry(_)
+            | Method::ControlList(_) => {
                 return responses::encode_error(
                     request.id,
                     "control_stream_required",

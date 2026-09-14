@@ -152,6 +152,7 @@ impl HeadlessServer {
         self.tab_geometry_controllers.retain(|tab_id, client_id| {
             topology.tab_workspace_ids.contains_key(tab_id) && live_clients.contains(client_id)
         });
+        self.prune_control_tab_geometry(|tab_id| topology.tab_workspace_ids.contains_key(tab_id));
         self.sync_control_geometry_tabs();
         for client in self
             .clients
@@ -297,6 +298,7 @@ impl HeadlessServer {
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
                 | Method::PaneFocus(_)
+                | Method::PaneMove(_)
                 | Method::PaneFocusDirection(_)
                 | Method::PaneResize(_)
                 | Method::PaneSplit(_)
@@ -675,7 +677,6 @@ impl HeadlessServer {
                             || self.control_connection_holds_tab(*controller, &tab_id)
                     });
             if !controller_is_viewing {
-                self.note_tab_geometry_owner(&tab_id, viewers[0]);
                 self.tab_geometry_controllers.insert(tab_id, viewers[0]);
             }
         }
@@ -729,7 +730,6 @@ impl HeadlessServer {
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };
-        self.note_tab_geometry_owner(&tab_id, client_id);
         let previous = self.tab_geometry_controllers.insert(tab_id, client_id);
         self.sync_control_geometry_tabs();
         if previous == Some(client_id) {
@@ -756,19 +756,9 @@ impl HeadlessServer {
         if self.tab_geometry_controllers.contains_key(&tab_id) {
             return false;
         }
-        self.note_tab_geometry_owner(&tab_id, client_id);
         self.tab_geometry_controllers.insert(tab_id, client_id);
         self.sync_control_geometry_tabs();
         self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
-    }
-
-    /// Chrome follows the geometry owner: a regular client taking a tab
-    /// gets the configured borders and gutters back, whatever a control
-    /// stream had asked for.
-    fn note_tab_geometry_owner(&mut self, tab_id: &str, client_id: u64) {
-        if !super::control_stream::is_control_connection_id(client_id) {
-            self.app.state.control_chromeless_tabs.remove(tab_id);
-        }
     }
 
     pub(super) fn resize_shell_tab_if_controller(
@@ -792,43 +782,55 @@ impl HeadlessServer {
         self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
     }
 
-    pub(super) fn shell_geometry_controller_for_terminal(
+    /// The tab a terminal is laid out in; a popup terminal belongs to the
+    /// tab whose viewers see the popup.
+    pub(super) fn tab_target_for_terminal(
         &self,
         terminal_id: &str,
-    ) -> Option<(u64, crate::ui::TabSurfaceTarget)> {
-        let target = if self
+    ) -> Option<crate::ui::TabSurfaceTarget> {
+        if self
             .app
             .state
             .popup_pane
             .as_ref()
             .is_some_and(|popup| popup.terminal_id.as_str() == terminal_id)
         {
-            self.popup_owner_tab_id
+            return self
+                .popup_owner_tab_id
                 .as_deref()
                 .and_then(|tab_id| self.app.parse_tab_id(tab_id))
                 .map(|(workspace_index, tab_index)| crate::ui::TabSurfaceTarget {
                     workspace_index,
                     tab_index,
-                })?
-        } else {
-            self.app.state.workspaces.iter().enumerate().find_map(
-                |(workspace_index, workspace)| {
-                    workspace
-                        .tabs
-                        .iter()
-                        .enumerate()
-                        .find_map(|(tab_index, tab)| {
-                            tab.panes
-                                .values()
-                                .any(|pane| pane.attached_terminal_id.as_str() == terminal_id)
-                                .then_some(crate::ui::TabSurfaceTarget {
-                                    workspace_index,
-                                    tab_index,
-                                })
-                        })
-                },
-            )?
-        };
+                });
+        }
+        self.app
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(workspace_index, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(tab_index, tab)| {
+                        tab.panes
+                            .values()
+                            .any(|pane| pane.attached_terminal_id.as_str() == terminal_id)
+                            .then_some(crate::ui::TabSurfaceTarget {
+                                workspace_index,
+                                tab_index,
+                            })
+                    })
+            })
+    }
+
+    pub(super) fn shell_geometry_controller_for_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> Option<(u64, crate::ui::TabSurfaceTarget)> {
+        let target = self.tab_target_for_terminal(terminal_id)?;
         let tab_id = self.tab_id_for_target(target)?;
         self.tab_geometry_controllers
             .get(&tab_id)

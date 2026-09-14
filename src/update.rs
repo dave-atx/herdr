@@ -2950,6 +2950,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 terminal_control_stream: 0,
+                control_features: Vec::new(),
                 server_pid: None,
             }),
         };
@@ -3026,6 +3027,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     terminal_control_stream: 0,
+                    control_features: Vec::new(),
                     server_pid: None,
                 }),
             },
@@ -3286,6 +3288,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     terminal_control_stream: 0,
+                    control_features: Vec::new(),
                     server_pid: None,
                 }),
             },

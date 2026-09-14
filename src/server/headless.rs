@@ -229,8 +229,8 @@ pub struct HeadlessServer {
     server_config_diagnostic: Option<String>,
     /// Server config warning with keybinding diagnostics removed for local-keybinding clients.
     server_config_diagnostic_without_keybindings: Option<String>,
-    /// Writable direct attach owner per terminal id string. Owners are client
-    /// ids or control connection ids.
+    /// Direct binary attach owner per terminal id string. Control stream
+    /// attaches share terminals and live in `control_connections` instead.
     terminal_attach_owners: HashMap<String, u64>,
     /// Open control streams keyed by connection id.
     control_connections: HashMap<u64, control_stream::ControlConnectionState>,
@@ -1832,8 +1832,16 @@ impl HeadlessServer {
             return false;
         }
 
-        if let Some(existing_owner) = self.terminal_attach_owners.get(&terminal_id).copied() {
-            if existing_owner != client_id && !takeover {
+        // A direct client sizes the terminal itself, so it cannot share it
+        // with anyone: not another direct client, not tab-following taps.
+        let existing_owner = self
+            .terminal_attach_owners
+            .get(&terminal_id)
+            .copied()
+            .filter(|owner| *owner != client_id);
+        let control_attached = self.terminal_has_control_attaches(&terminal_id);
+        if existing_owner.is_some() || control_attached {
+            if !takeover {
                 self.send_to_client(
                     client_id,
                     ServerMessage::ServerShutdown {
@@ -1845,22 +1853,20 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
                 return false;
             }
-            if existing_owner != client_id {
-                if control_stream::is_control_connection_id(existing_owner) {
-                    self.detach_control_attaches_for_terminal(
-                        &terminal_id,
-                        api::schema::TerminalDetachReason::Takeover,
-                    );
-                } else {
-                    self.send_to_client(
-                        existing_owner,
-                        ServerMessage::ServerShutdown {
-                            reason: Some("terminal attach taken over".to_owned()),
-                        },
-                    );
-                    self.remove_client_and_resize_if_needed(existing_owner);
-                }
+            if let Some(existing_owner) = existing_owner {
+                self.send_to_client(
+                    existing_owner,
+                    ServerMessage::ServerShutdown {
+                        reason: Some("terminal attach taken over".to_owned()),
+                    },
+                );
+                self.remove_client_and_resize_if_needed(existing_owner);
             }
+            self.detach_control_attaches_for_terminal(
+                &terminal_id,
+                api::schema::TerminalDetachReason::Takeover,
+                control_stream::EvictScope::All,
+            );
         }
 
         let stamp = self.allocate_activity_stamp();
@@ -2744,9 +2750,7 @@ impl HeadlessServer {
         }
         let lines = lines.unwrap_or(80).min(1000) as usize;
         if lines == 0
-            || self
-                .terminal_attach_owners
-                .contains_key(target.terminal_id.as_str())
+            || self.terminal_is_attached(target.terminal_id.as_str())
             || self
                 .pending_alt_screen_reads
                 .iter()
@@ -2792,9 +2796,7 @@ impl HeadlessServer {
                 .terminals
                 .get(&read.terminal_id)
                 .is_some_and(|terminal| terminal.state == crate::detect::AgentState::Idle);
-            let attached = self
-                .terminal_attach_owners
-                .contains_key(read.terminal_id.as_str());
+            let attached = self.terminal_is_attached(read.terminal_id.as_str());
             let outcome = if remains_idle && !attached {
                 read.poll(runtime, now)
             } else {

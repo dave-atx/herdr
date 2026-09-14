@@ -674,6 +674,34 @@ pub struct PaneLayoutSnapshot {
     pub focused_pane_id: String,
     pub panes: Vec<PaneLayoutPane>,
     pub splits: Vec<PaneLayoutSplit>,
+    /// Who sizes this tab. Absent on servers without geometry ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_controller: Option<GeometryController>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GeometryControllerKind {
+    /// A control stream owns the tab's geometry.
+    Control,
+    /// A Herdr client (TUI or endpoint shell) owns it.
+    Client,
+    /// Nobody claimed it; the tab follows the shared view area.
+    #[default]
+    None,
+}
+
+/// The connection that sizes a tab, and the chrome it asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct GeometryController {
+    pub kind: GeometryControllerKind,
+    /// Connection id for `control`, client id for `client`, absent for `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<u64>,
+    #[serde(default)]
+    pub chrome: super::terminal::TabChrome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

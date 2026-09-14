@@ -5,6 +5,50 @@
   "schemas": {
     "control_record": {
       "$defs": {
+        "GeometryController": {
+          "description": "The connection that sizes a tab, and the chrome it asked for.",
+          "properties": {
+            "chrome": {
+              "$ref": "#/schemas/control_record/$defs/TabChrome",
+              "default": "server"
+            },
+            "connection_id": {
+              "description": "Connection id for `control`, client id for `client`, absent for `none`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/control_record/$defs/GeometryControllerKind"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "GeometryControllerKind": {
+          "oneOf": [
+            {
+              "const": "control",
+              "description": "A control stream owns the tab's geometry.",
+              "type": "string"
+            },
+            {
+              "const": "client",
+              "description": "A Herdr client (TUI or endpoint shell) owns it.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Nobody claimed it; the tab follows the shared view area.",
+              "type": "string"
+            }
+          ]
+        },
         "PaneLayoutPane": {
           "properties": {
             "focused": {
@@ -66,6 +110,17 @@
             },
             "focused_pane_id": {
               "type": "string"
+            },
+            "geometry_controller": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/control_record/$defs/GeometryController"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who sizes this tab. Absent on servers without geometry ownership."
             },
             "panes": {
               "items": {
@@ -155,6 +210,21 @@
             "down"
           ],
           "type": "string"
+        },
+        "TabChrome": {
+          "description": "Layout chrome for a tab a control stream sizes.",
+          "oneOf": [
+            {
+              "const": "server",
+              "description": "Borders, gaps, and scrollbar gutters follow the server's config.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Panes tile the area exactly; the client draws its own dividers.",
+              "type": "string"
+            }
+          ]
         },
         "TerminalCursorInfo": {
           "properties": {
@@ -474,6 +544,52 @@
           "required": [
             "type",
             "layout"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Whether this attach now answers the pane's terminal queries. Sent\nonly on control protocol 2 and later.",
+          "properties": {
+            "answers_queries": {
+              "type": "boolean"
+            },
+            "attach_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal.authority",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attach_id",
+            "answers_queries"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Subscription events were lost because the stream fell behind; the\nnext event delivered has sequence `resume_sequence`. Protocol 2+.",
+          "properties": {
+            "dropped": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resume_sequence": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "events.gap",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "dropped",
+            "resume_sequence"
           ],
           "type": "object"
         }
@@ -1200,6 +1316,40 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "geometry_controller": {
+                  "$ref": "#/schemas/event/$defs/GeometryController"
+                },
+                "previous": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/GeometryController"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_geometry_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id",
+                "geometry_controller"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -1221,6 +1371,7 @@
             "tab_renamed",
             "tab_moved",
             "tab_focused",
+            "tab_geometry_changed",
             "pane_created",
             "pane_closed",
             "pane_updated",
@@ -1233,6 +1384,50 @@
             "layout_updated"
           ],
           "type": "string"
+        },
+        "GeometryController": {
+          "description": "The connection that sizes a tab, and the chrome it asked for.",
+          "properties": {
+            "chrome": {
+              "$ref": "#/schemas/event/$defs/TabChrome",
+              "default": "server"
+            },
+            "connection_id": {
+              "description": "Connection id for `control`, client id for `client`, absent for `none`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/event/$defs/GeometryControllerKind"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "GeometryControllerKind": {
+          "oneOf": [
+            {
+              "const": "control",
+              "description": "A control stream owns the tab's geometry.",
+              "type": "string"
+            },
+            {
+              "const": "client",
+              "description": "A Herdr client (TUI or endpoint shell) owns it.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Nobody claimed it; the tab follows the shared view area.",
+              "type": "string"
+            }
+          ]
         },
         "PaneInfo": {
           "properties": {
@@ -1417,6 +1612,17 @@
             "focused_pane_id": {
               "type": "string"
             },
+            "geometry_controller": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/GeometryController"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who sizes this tab. Absent on servers without geometry ownership."
+            },
             "panes": {
               "items": {
                 "$ref": "#/schemas/event/$defs/PaneLayoutPane"
@@ -1505,6 +1711,21 @@
             "down"
           ],
           "type": "string"
+        },
+        "TabChrome": {
+          "description": "Layout chrome for a tab a control stream sizes.",
+          "oneOf": [
+            {
+              "const": "server",
+              "description": "Borders, gaps, and scrollbar gutters follow the server's config.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Panes tile the area exactly; the client draws its own dividers.",
+              "type": "string"
+            }
+          ]
         },
         "TabInfo": {
           "properties": {
@@ -2230,7 +2451,41 @@
           ],
           "type": "object"
         },
+        "ControlClientInfo": {
+          "description": "Identity a control client declares on `control.open`.",
+          "properties": {
+            "name": {
+              "default": "",
+              "type": "string"
+            },
+            "protocol": {
+              "default": 0,
+              "description": "Highest control stream protocol the client speaks; the server\nnegotiates down to what it supports.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
         "ControlOpenParams": {
+          "properties": {
+            "client": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/ControlClientInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who is opening the stream. Absent for protocol 1 clients."
+            }
+          },
           "type": "object"
         },
         "EmptyParams": {
@@ -4643,6 +4898,18 @@
             {
               "properties": {
                 "type": {
+                  "const": "tab.geometry_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "pane.created",
                   "type": "string"
                 }
@@ -4831,6 +5098,24 @@
             }
           ]
         },
+        "TabClaimGeometryParams": {
+          "description": "`tab.claim_geometry`: take a tab's geometry with the size this stream\nstored for it. `attach_id` names the tab through an attach instead.",
+          "properties": {
+            "attach_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "TabCreateParams": {
           "properties": {
             "cwd": {
@@ -4925,6 +5210,11 @@
               "$ref": "#/schemas/request/$defs/TabChrome",
               "default": "server",
               "description": "Whether Herdr lays the tab out with its own borders, gaps, and\nscrollbar gutters, or hands the client bare pane rectangles."
+            },
+            "claim": {
+              "default": true,
+              "description": "Take the tab's geometry now (the default). With `false` the size is\nonly stored, for a later `tab.claim_geometry` or input-driven claim.",
+              "type": "boolean"
             },
             "cols": {
               "format": "uint16",
@@ -5066,6 +5356,10 @@
           "properties": {
             "attach_id": {
               "type": "string"
+            },
+            "auto": {
+              "description": "The client's emulator answered a query (DA, CPR, colours) rather\nthan the user typing: forwarded only from the query authority and\nnever counted as interaction.",
+              "type": "boolean"
             },
             "bytes": {
               "description": "Base64 bytes written to the PTY verbatim.",
@@ -7213,6 +7507,38 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.claim_geometry",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabClaimGeometryParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "control.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -7683,6 +8009,151 @@
             "failed"
           ],
           "type": "string"
+        },
+        "ControlAttachInfo": {
+          "properties": {
+            "answer_queries": {
+              "$ref": "#/schemas/success_response/$defs/TerminalQueryAuthority"
+            },
+            "answers_queries": {
+              "description": "Whether this attach is the one emulator answering the pane's queries.",
+              "type": "boolean"
+            },
+            "attach_id": {
+              "type": "string"
+            },
+            "geometry": {
+              "$ref": "#/schemas/success_response/$defs/TerminalAttachGeometry"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "attach_id",
+            "terminal_id",
+            "geometry",
+            "answer_queries",
+            "answers_queries"
+          ],
+          "type": "object"
+        },
+        "ControlClientInfo": {
+          "description": "Identity a control client declares on `control.open`.",
+          "properties": {
+            "name": {
+              "default": "",
+              "type": "string"
+            },
+            "protocol": {
+              "default": 0,
+              "description": "Highest control stream protocol the client speaks; the server\nnegotiates down to what it supports.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "ControlConnectionInfo": {
+          "description": "One open control stream, as `control.list` reports it.",
+          "properties": {
+            "attaches": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/ControlAttachInfo"
+              },
+              "type": "array"
+            },
+            "client": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ControlClientInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "connection_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "control_protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tabs": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/ControlTabInfo"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "connection_id",
+            "control_protocol",
+            "attaches",
+            "tabs"
+          ],
+          "type": "object"
+        },
+        "ControlTabInfo": {
+          "description": "A tab a control stream stored a size for. `controller` is true while the\nstream owns the tab's geometry.",
+          "properties": {
+            "cell_height_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "chrome": {
+              "$ref": "#/schemas/success_response/$defs/TabChrome"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "controller": {
+              "type": "boolean"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "cols",
+            "rows",
+            "cell_width_px",
+            "cell_height_px",
+            "chrome",
+            "controller"
+          ],
+          "type": "object"
         },
         "EventData": {
           "oneOf": [
@@ -8328,6 +8799,40 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "geometry_controller": {
+                  "$ref": "#/schemas/success_response/$defs/GeometryController"
+                },
+                "previous": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/GeometryController"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_geometry_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id",
+                "geometry_controller"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -8364,6 +8869,7 @@
             "tab_renamed",
             "tab_moved",
             "tab_focused",
+            "tab_geometry_changed",
             "pane_created",
             "pane_closed",
             "pane_updated",
@@ -8376,6 +8882,50 @@
             "layout_updated"
           ],
           "type": "string"
+        },
+        "GeometryController": {
+          "description": "The connection that sizes a tab, and the chrome it asked for.",
+          "properties": {
+            "chrome": {
+              "$ref": "#/schemas/success_response/$defs/TabChrome",
+              "default": "server"
+            },
+            "connection_id": {
+              "description": "Connection id for `control`, client id for `client`, absent for `none`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/GeometryControllerKind"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "GeometryControllerKind": {
+          "oneOf": [
+            {
+              "const": "control",
+              "description": "A control stream owns the tab's geometry.",
+              "type": "string"
+            },
+            {
+              "const": "client",
+              "description": "A Herdr client (TUI or endpoint shell) owns it.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Nobody claimed it; the tab follows the shared view area.",
+              "type": "string"
+            }
+          ]
         },
         "InstalledPluginInfo": {
           "properties": {
@@ -8939,6 +9489,17 @@
             },
             "focused_pane_id": {
               "type": "string"
+            },
+            "geometry_controller": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/GeometryController"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who sizes this tab. Absent on servers without geometry ownership."
             },
             "panes": {
               "items": {
@@ -11366,6 +11927,13 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "control_protocol": {
+                  "default": 0,
+                  "description": "Control stream protocol negotiated for this connection.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "protocol": {
                   "format": "uint32",
                   "minimum": 0,
@@ -11385,6 +11953,34 @@
                 "boot_id",
                 "version",
                 "protocol"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Open control streams and what they hold.",
+              "properties": {
+                "connections": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/ControlConnectionInfo"
+                  },
+                  "type": "array"
+                },
+                "self_connection_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "control_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "connections"
               ],
               "type": "object"
             },
@@ -11431,6 +12027,13 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "control_features": {
+              "description": "Control stream features by name; clients gate on these, not on the\nprotocol number alone.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
@@ -11556,6 +12159,21 @@
           ],
           "type": "string"
         },
+        "TabChrome": {
+          "description": "Layout chrome for a tab a control stream sizes.",
+          "oneOf": [
+            {
+              "const": "server",
+              "description": "Borders, gaps, and scrollbar gutters follow the server's config.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Panes tile the area exactly; the client draws its own dividers.",
+              "type": "string"
+            }
+          ]
+        },
         "TabInfo": {
           "properties": {
             "agent_status": {
@@ -11594,6 +12212,36 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TerminalAttachGeometry": {
+          "description": "Who decides the pane's size while the attach owns the terminal.",
+          "oneOf": [
+            {
+              "const": "tab",
+              "description": "Sizes follow the tab layout; the client drives it with `tab.set_geometry`.",
+              "type": "string"
+            },
+            {
+              "const": "terminal",
+              "description": "The client sizes this one terminal with `terminal.resize` and Herdr\nlocks the tab layout out of it, like a direct terminal attach.",
+              "type": "string"
+            }
+          ]
+        },
+        "TerminalQueryAuthority": {
+          "description": "Which terminal emulator answers queries the pane application sends\n(device attributes, XTGETTCAP, OSC color queries).",
+          "oneOf": [
+            {
+              "const": "client",
+              "description": "The attaching client answers; Herdr suppresses its own replies while\nthe attach owns the terminal.",
+              "type": "string"
+            },
+            {
+              "const": "server",
+              "description": "Herdr keeps answering as it does for every other client.",
+              "type": "string"
+            }
+          ]
         },
         "WorkspaceInfo": {
           "properties": {

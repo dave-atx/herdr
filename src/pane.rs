@@ -3207,13 +3207,39 @@ impl PaneRuntime {
         outbound: crate::api::control::ControlOutboundSender,
         budget: Arc<RawTapBudget>,
         suppress_terminal_responses: bool,
+        protocol: u32,
     ) {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        self.raw_taps
-            .insert(attach_id, outbound, budget, suppress_terminal_responses);
+        self.raw_taps.insert(
+            attach_id,
+            outbound,
+            budget,
+            suppress_terminal_responses,
+            protocol,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_query_authority_for_test(&self) -> Option<String> {
+        self.raw_taps.authority_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suppresses_terminal_responses_for_test(&self) -> bool {
+        self.raw_taps.suppress_terminal_responses()
+    }
+
+    /// Picks the tap that answers queries, under the lock so a read in
+    /// flight sees one consistent answer.
+    pub(crate) fn set_raw_query_authority(&self, attach_id: Option<&str>) {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps.set_authority(attach_id);
     }
 
     /// Emit a snapshot on a live tap, ordered against output.
@@ -3545,7 +3571,14 @@ mod tests {
 
         let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hello\r\n");
         let (tx, rx) = std::sync::mpsc::channel();
-        runtime.attach_raw("1-0".into(), tx, Arc::new(RawTapBudget::new(1 << 20)), true);
+        runtime.attach_raw(
+            "1-0".into(),
+            tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            1,
+        );
+        runtime.set_raw_query_authority(Some("1-0"));
         // Output before the first snapshot never streams: the snapshot covers
         // it, so the server still answers queries in that window.
         assert!(!runtime.raw_taps.suppress_terminal_responses());
@@ -3619,7 +3652,14 @@ mod tests {
         let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hi");
         runtime.test_process_pty_bytes(b"\x1b[");
         let (tx, rx) = std::sync::mpsc::channel();
-        runtime.attach_raw("1-0".into(), tx, Arc::new(RawTapBudget::new(1 << 20)), true);
+        runtime.attach_raw(
+            "1-0".into(),
+            tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            1,
+        );
+        runtime.set_raw_query_authority(Some("1-0"));
         assert!(runtime.snapshot_raw("1-0", 1 << 20));
         runtime.test_process_pty_bytes(b"6n");
 
@@ -3663,7 +3703,13 @@ mod tests {
         let screen = b"line1\r\nline2\r\nline3\r\n";
         let runtime = PaneRuntime::test_with_screen_bytes(20, 5, screen);
         let (tx, rx) = std::sync::mpsc::channel();
-        runtime.attach_raw("1-0".into(), tx, Arc::new(RawTapBudget::new(1 << 20)), true);
+        runtime.attach_raw(
+            "1-0".into(),
+            tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            1,
+        );
         assert!(runtime.snapshot_raw("1-0", 1 << 20));
         let _ = rx.try_iter().count();
 

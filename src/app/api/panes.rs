@@ -2055,15 +2055,46 @@ impl App {
             })
             .collect();
 
+        let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
+        let geometry_controller = Some(
+            self.state
+                .control_tab_geometry_controllers
+                .get(&tab_id)
+                .cloned()
+                .unwrap_or_default(),
+        );
         Some(PaneLayoutSnapshot {
             workspace_id: self.public_workspace_id(ws_idx),
-            tab_id: self.public_tab_id(ws_idx, tab_idx)?,
+            tab_id,
             zoomed: tab.zoomed,
             area: area.into(),
             focused_pane_id,
             panes,
             splits,
+            geometry_controller,
         })
+    }
+
+    /// Announces a change of the connection that sizes a tab.
+    pub(crate) fn emit_tab_geometry_changed(
+        &mut self,
+        tab_id: String,
+        geometry_controller: crate::api::schema::GeometryController,
+        previous: Option<crate::api::schema::GeometryController>,
+    ) {
+        let Some((ws_idx, _)) = self.parse_tab_id(&tab_id) else {
+            return;
+        };
+        let workspace_id = self.public_workspace_id(ws_idx);
+        self.emit_event(EventEnvelope {
+            event: EventKind::TabGeometryChanged,
+            data: EventData::TabGeometryChanged {
+                tab_id,
+                workspace_id,
+                geometry_controller,
+                previous,
+            },
+        });
     }
 
     pub(crate) fn emit_layout_updated_event(&mut self, ws_idx: usize, tab_idx: usize) {

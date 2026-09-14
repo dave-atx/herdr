@@ -10,7 +10,7 @@ use std::time::Duration;
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 
-use crate::api::schema::{ControlOpenParams, Method, Request};
+use crate::api::schema::{ControlClientInfo, ControlOpenParams, Method, Request};
 use crate::ipc::LocalStream;
 
 const USAGE: &str = "usage: herdr [--session NAME] control";
@@ -45,7 +45,9 @@ pub(super) fn run_control_command(args: &[String]) -> io::Result<i32> {
 
     let open = Request {
         id: "control".into(),
-        method: Method::ControlOpen(ControlOpenParams::default()),
+        method: Method::ControlOpen(ControlOpenParams {
+            client: client_info_from_env(),
+        }),
     };
     let mut line = serde_json::to_string(&open).map_err(io::Error::other)?;
     line.push('\n');
@@ -72,6 +74,39 @@ pub(super) fn run_control_command(args: &[String]) -> io::Result<i32> {
 
     forward_stdio(reader, stream, stdout)?;
     Ok(0)
+}
+
+/// Identity from the environment, so a remote client can name itself
+/// without flags an older `herdr control` would reject.
+/// `HERDR_CONTROL_CLIENT="name/version"`, `HERDR_CONTROL_PROTOCOL=2`.
+/// Neither set sends no `client` at all: a client that predates both keeps
+/// the protocol 1 contract exactly as with an older binary.
+fn client_info_from_env() -> Option<ControlClientInfo> {
+    let protocol = std::env::var("HERDR_CONTROL_PROTOCOL")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let label = std::env::var("HERDR_CONTROL_CLIENT")
+        .ok()
+        .filter(|label| !label.trim().is_empty());
+    if protocol.is_none() && label.is_none() {
+        return None;
+    }
+    let protocol = protocol.unwrap_or(1);
+    let (name, version) = match label {
+        Some(label) => {
+            let mut parts = label.trim().splitn(2, '/');
+            (
+                parts.next().unwrap_or_default().to_owned(),
+                parts.next().unwrap_or_default().to_owned(),
+            )
+        }
+        None => ("herdr-control".into(), crate::build_info::version()),
+    };
+    Some(ControlClientInfo {
+        name,
+        version,
+        protocol,
+    })
 }
 
 fn forward_stdio(
@@ -151,4 +186,7 @@ fn print_help() {
     eprintln!("The first line printed is the control.open response with the server's");
     eprintln!("boot id and capabilities. Send requests on stdin; responses, subscription");
     eprintln!("events, and terminal records arrive on stdout. EOF on stdin closes the stream.");
+    eprintln!();
+    eprintln!("HERDR_CONTROL_CLIENT=name/version names the client on control.open;");
+    eprintln!("HERDR_CONTROL_PROTOCOL caps the control stream protocol it negotiates.");
 }

@@ -158,6 +158,9 @@ impl ActiveSubscription {
                 Ok(event_subscription(EventKind::PaneAgentDetected))
             }
             Subscription::LayoutUpdated {} => Ok(event_subscription(EventKind::LayoutUpdated)),
+            Subscription::TabGeometryChanged {} => {
+                Ok(event_subscription(EventKind::TabGeometryChanged))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,
@@ -265,6 +268,19 @@ impl ActiveSubscription {
         }
     }
 
+    /// Every pending event at once, for streams that must not fall a poll
+    /// tick behind per event. Stateful subscriptions still yield one.
+    pub(super) fn poll_batch(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        event_hub: &EventHub,
+    ) -> (Vec<serde_json::Value>, Option<super::event_hub::EventGap>) {
+        match self {
+            Self::Event(subscription) => subscription.poll_all(event_hub),
+            _ => (self.poll(api_tx, event_hub).into_iter().collect(), None),
+        }
+    }
+
     pub(super) fn poll_for_wait(
         &mut self,
         api_tx: &ApiRequestSender,
@@ -288,6 +304,23 @@ impl ActiveEventSubscription {
             }
         }
         None
+    }
+
+    fn poll_all(
+        &mut self,
+        event_hub: &EventHub,
+    ) -> (Vec<serde_json::Value>, Option<super::event_hub::EventGap>) {
+        let (events, gap) = event_hub.events_after_with_gap(self.last_sequence);
+        let mut matched = Vec::new();
+        for (sequence, event) in events {
+            self.last_sequence = sequence;
+            if event.event == self.event_kind {
+                if let Ok(value) = serde_json::to_value(event) {
+                    matched.push(value);
+                }
+            }
+        }
+        (matched, gap)
     }
 }
 
@@ -662,6 +695,42 @@ mod tests {
         event_hub.push(workspace_focused_event("after_setup"));
         let live_event = subscription.poll(&api_tx, &event_hub).expect("live event");
         assert_eq!(live_event["data"]["workspace_id"], "after_setup");
+    }
+
+    /// A control stream drains every pending event per tick instead of one,
+    /// and hears about events the ring dropped before it polled.
+    #[test]
+    fn poll_batch_drains_every_matching_event_and_reports_ring_gaps() {
+        let event_hub = EventHub::default();
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscription = ActiveSubscription::new(
+            Subscription::WorkspaceFocused {},
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_hub.current_sequence(),
+        )
+        .expect("workspace focus subscription");
+
+        for index in 0..5 {
+            event_hub.push(workspace_focused_event(&format!("w{index}")));
+            event_hub.push(presentation_event(None));
+        }
+        let (events, gap) = subscription.poll_batch(&api_tx, &event_hub);
+        assert_eq!(events.len(), 5, "every matching event in one poll");
+        assert_eq!(events[4]["data"]["workspace_id"], "w4");
+        assert!(gap.is_none());
+        assert!(subscription.poll_batch(&api_tx, &event_hub).0.is_empty());
+
+        for index in 0..(EventHub::MAX_EVENTS + 10) {
+            event_hub.push(workspace_focused_event(&format!("late{index}")));
+        }
+        let (events, gap) = subscription.poll_batch(&api_tx, &event_hub);
+        assert_eq!(events.len(), EventHub::MAX_EVENTS);
+        let gap = gap.expect("a reader behind the ring is told");
+        assert_eq!(gap.dropped, 10);
+        assert_eq!(events[0]["data"]["workspace_id"], "late10");
     }
 
     #[test]

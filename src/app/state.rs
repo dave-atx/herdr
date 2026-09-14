@@ -798,6 +798,9 @@ pub struct AppState {
     /// recomputes driven by herdr's own view leave their panes alone; only
     /// `tab.set_geometry` (through the layout boundary) resizes them.
     pub control_geometry_tabs: std::collections::HashSet<String>,
+    /// Who sizes each public tab id, as reported in layout snapshots.
+    pub control_tab_geometry_controllers:
+        std::collections::HashMap<String, crate::api::schema::GeometryController>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
@@ -1031,6 +1034,7 @@ impl AppState {
             direct_attach_resize_locks: std::collections::HashSet::new(),
             control_chromeless_tabs: std::collections::HashSet::new(),
             control_geometry_tabs: std::collections::HashSet::new(),
+            control_tab_geometry_controllers: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),

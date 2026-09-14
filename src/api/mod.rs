@@ -8,6 +8,8 @@ mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
+#[cfg(test)]
+pub(crate) use server::control_stream::terminal_input as control_stream_terminal_input;
 pub(crate) use server::default_capabilities as default_server_capabilities;
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};
@@ -86,6 +88,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PluginPaneFocus(_)
             | Method::PluginPaneClose(_)
             | Method::TabSetGeometry(_)
+            | Method::TabClaimGeometry(_)
     )
 }
 

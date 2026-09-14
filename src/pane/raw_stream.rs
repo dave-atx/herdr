@@ -88,8 +88,15 @@ struct RawTap {
     /// an attach the client has not been told about, and the snapshot taken
     /// under the same lock covers those bytes anyway.
     armed: bool,
-    /// The client answers terminal queries once this tap is armed.
+    /// The client wants to answer terminal queries.
     suppress_responses: bool,
+    /// The one tap on this terminal chosen to answer queries; suppression
+    /// follows it, not every client-authority tap. None until the first
+    /// sync so every protocol 2 tap is told its standing once.
+    is_authority: Option<bool>,
+    /// Control protocol of the owning connection; authority records go
+    /// only to protocol 2 and later.
+    protocol: u32,
 }
 
 impl RawTap {
@@ -221,6 +228,7 @@ impl RawTapRegistry {
         outbound: ControlOutboundSender,
         budget: Arc<RawTapBudget>,
         suppress_responses: bool,
+        protocol: u32,
     ) {
         let tap = RawTap {
             attach_id,
@@ -230,11 +238,44 @@ impl RawTapRegistry {
             dropped: 0,
             armed: false,
             suppress_responses,
+            is_authority: None,
+            protocol,
         };
         if let Ok(mut taps) = self.taps.lock() {
             taps.push(tap);
             self.count.store(taps.len(), Ordering::Release);
         }
+    }
+
+    /// Names the tap that answers queries. Taps whose standing changed and
+    /// speak protocol 2 learn it through a `terminal.authority` record.
+    pub(crate) fn set_authority(&self, attach_id: Option<&str>) {
+        let Ok(mut taps) = self.taps.lock() else {
+            return;
+        };
+        for tap in taps.iter_mut() {
+            let is_authority = attach_id == Some(tap.attach_id.as_str());
+            if tap.is_authority == Some(is_authority) {
+                continue;
+            }
+            tap.is_authority = Some(is_authority);
+            if tap.protocol >= 2 {
+                let _ = tap.outbound.send(ControlOutbound::Authority {
+                    attach_id: tap.attach_id.clone(),
+                    answers_queries: is_authority && tap.suppress_responses,
+                });
+            }
+        }
+        self.sync_suppression(&taps);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authority_for_test(&self) -> Option<String> {
+        self.taps
+            .lock()
+            .ok()?
+            .iter()
+            .find_map(|tap| (tap.is_authority == Some(true)).then(|| tap.attach_id.clone()))
     }
 
     /// Emit a fresh snapshot on one tap, stamped with its current sequence.
@@ -297,7 +338,9 @@ impl RawTapRegistry {
     }
 
     fn sync_suppression(&self, taps: &[RawTap]) {
-        let suppress = taps.iter().any(|tap| tap.armed && tap.suppress_responses);
+        let suppress = taps
+            .iter()
+            .any(|tap| tap.armed && tap.is_authority == Some(true) && tap.suppress_responses);
         self.suppress_terminal_responses
             .store(suppress, Ordering::Release);
     }
@@ -443,7 +486,7 @@ mod tests {
     fn taps_stay_silent_until_the_first_snapshot() {
         let registry = RawTapRegistry::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), false);
+        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), false, 1);
         registry.publish(b"before");
         assert!(rx.try_recv().is_err());
         arm(&registry, "a1", &rx);
@@ -457,7 +500,8 @@ mod tests {
     fn query_suppression_starts_with_the_first_snapshot_and_ends_on_detach() {
         let registry = RawTapRegistry::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), true);
+        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), true, 1);
+        registry.set_authority(Some("a1"));
         assert!(!registry.suppress_terminal_responses());
         arm(&registry, "a1", &rx);
         assert!(registry.suppress_terminal_responses());
@@ -468,13 +512,73 @@ mod tests {
             observer_tx,
             Arc::new(RawTapBudget::new(1024)),
             false,
+            1,
         );
         arm(&registry, "a2", &observer_rx);
         assert!(registry.remove("a1", TerminalDetachReason::Takeover));
+        registry.set_authority(Some("a2"));
         assert!(
             !registry.suppress_terminal_responses(),
             "an observer never suppresses replies"
         );
+    }
+
+    /// Two client-authority taps share a terminal; only the designated one
+    /// suppresses, and a protocol 2 tap hears each change of standing.
+    #[test]
+    fn suppression_follows_the_authority_and_protocol_two_taps_are_told() {
+        let registry = RawTapRegistry::default();
+        let (v1_tx, v1_rx) = std::sync::mpsc::channel();
+        let (v2_tx, v2_rx) = std::sync::mpsc::channel();
+        registry.insert(
+            "a1".into(),
+            v1_tx,
+            Arc::new(RawTapBudget::new(1024)),
+            true,
+            1,
+        );
+        registry.insert(
+            "b1".into(),
+            v2_tx,
+            Arc::new(RawTapBudget::new(1024)),
+            true,
+            2,
+        );
+        arm(&registry, "a1", &v1_rx);
+        arm(&registry, "b1", &v2_rx);
+        assert!(
+            !registry.suppress_terminal_responses(),
+            "no authority yet: the server answers"
+        );
+
+        registry.set_authority(Some("b1"));
+        assert!(registry.suppress_terminal_responses());
+        assert_eq!(registry.authority_for_test().as_deref(), Some("b1"));
+        assert!(matches!(
+            v2_rx.try_recv(),
+            Ok(ControlOutbound::Authority {
+                answers_queries: true,
+                ..
+            })
+        ));
+        assert!(
+            v1_rx.try_recv().is_err(),
+            "a protocol 1 tap never receives authority records"
+        );
+
+        registry.set_authority(Some("a1"));
+        assert!(registry.suppress_terminal_responses());
+        assert!(matches!(
+            v2_rx.try_recv(),
+            Ok(ControlOutbound::Authority {
+                answers_queries: false,
+                ..
+            })
+        ));
+        assert!(v1_rx.try_recv().is_err());
+
+        registry.set_authority(None);
+        assert!(!registry.suppress_terminal_responses());
     }
 
     #[test]
@@ -505,7 +609,7 @@ mod tests {
         assert_eq!(registry.pending_tail_for_test(), b"\x1b[3");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), true);
+        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), true, 1);
         arm(&registry, "a1", &rx);
         registry.note_read(b"1m");
         registry.publish(b"1m");
@@ -535,7 +639,7 @@ mod tests {
     fn taps_number_output_from_one() {
         let registry = RawTapRegistry::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), false);
+        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), false, 1);
         arm(&registry, "a1", &rx);
         registry.publish(b"one");
         registry.publish(b"two");
@@ -548,7 +652,7 @@ mod tests {
         let registry = RawTapRegistry::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let budget = Arc::new(RawTapBudget::new(4));
-        registry.insert("a1".into(), tx, Arc::clone(&budget), false);
+        registry.insert("a1".into(), tx, Arc::clone(&budget), false, 1);
         arm(&registry, "a1", &rx);
 
         registry.publish(b"1234");
@@ -582,7 +686,7 @@ mod tests {
     fn removing_a_tap_sends_detached_and_stops_publishing() {
         let registry = RawTapRegistry::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), false);
+        registry.insert("a1".into(), tx, Arc::new(RawTapBudget::new(1024)), false, 1);
         assert!(registry.has_taps());
         assert!(registry.remove("a1", TerminalDetachReason::Takeover));
         assert!(!registry.has_taps());

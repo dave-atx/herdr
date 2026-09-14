@@ -1,18 +1,20 @@
-//! Server side of control streams: raw terminal attaches, their ownership,
-//! and tab geometry claims made by a client that renders panes itself.
+//! Server side of control streams: raw terminal attaches, their sharing,
+//! and tab geometry ownership for clients that render panes themselves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
 use tracing::info;
 
 use crate::api;
-use crate::api::control::ControlConnectionHandle;
+use crate::api::control::{ControlConnectionHandle, CONTROL_STREAM_PROTOCOL};
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, ResponseResult, SuccessResponse, TabSetGeometryParams,
-    TerminalAttachGeometry, TerminalAttachParams, TerminalAttachTarget, TerminalDetachReason,
-    TerminalQueryAuthority, TerminalResizeParams,
+    ControlAttachInfo, ControlClientInfo, ControlConnectionInfo, ControlTabInfo, ErrorBody,
+    ErrorResponse, GeometryController, GeometryControllerKind, ResponseResult, SuccessResponse,
+    TabChrome, TabClaimGeometryParams, TabSetGeometryParams, TerminalAttachGeometry,
+    TerminalAttachParams, TerminalAttachTarget, TerminalDetachReason, TerminalQueryAuthority,
+    TerminalResizeParams,
 };
 use crate::pane::raw_stream::{RawTapBudget, DEFAULT_TAP_BUDGET_BYTES};
 use crate::protocol::ServerMessage;
@@ -29,28 +31,63 @@ pub(super) fn is_control_connection_id(id: u64) -> bool {
     id >= CONTROL_CONNECTION_ID_BASE
 }
 
+/// Which control attaches a takeover evicts from a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EvictScope {
+    /// Every attach: a size owner is arriving.
+    All,
+    /// A tab follower is arriving: size owners go, and so do followers on
+    /// protocol 1 connections, which expect exclusive ownership.
+    TabFollowerTakeover,
+}
+
+impl EvictScope {
+    fn evicts(self, geometry: TerminalAttachGeometry, protocol: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::TabFollowerTakeover => {
+                geometry == TerminalAttachGeometry::Terminal || protocol <= 1
+            }
+        }
+    }
+}
+
+/// Size and chrome a control connection asked for on one tab, whether or
+/// not it currently owns the tab.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ControlTabGeometry {
+    cols: u16,
+    rows: u16,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    chrome: TabChrome,
+    /// Activity stamp of the last claim or input from this connection on
+    /// the tab; the successor on owner disconnect is the highest.
+    last_interaction: u64,
+}
+
 pub(super) struct ControlConnectionState {
     handle: ControlConnectionHandle,
     attaches: HashMap<String, ControlAttach>,
-    /// Requested size per tab id this connection controls.
-    tab_geometry: HashMap<String, (u16, u16, crate::kitty_graphics::HostCellSize)>,
+    tab_geometry: HashMap<String, ControlTabGeometry>,
     next_attach: u64,
+    client: Option<ControlClientInfo>,
+    /// Negotiated control stream protocol, 1 for clients that sent none.
+    protocol: u32,
 }
 
 impl ControlConnectionState {
+    /// Whether this connection stored a size for the tab, owner or not.
     pub(super) fn holds_tab(&self, tab_id: &str) -> bool {
         self.tab_geometry.contains_key(tab_id)
-    }
-
-    pub(super) fn has_tab_claims(&self) -> bool {
-        !self.tab_geometry.is_empty()
     }
 
     pub(super) fn tab_geometry(
         &self,
         tab_id: &str,
     ) -> Option<(u16, u16, crate::kitty_graphics::HostCellSize)> {
-        self.tab_geometry.get(tab_id).copied()
+        self.tab_geometry
+            .get(tab_id)
+            .map(|geometry| (geometry.cols, geometry.rows, geometry.cell_size))
     }
 }
 
@@ -58,6 +95,11 @@ struct ControlAttach {
     terminal_id: String,
     geometry: TerminalAttachGeometry,
     history_limit_bytes: usize,
+    answer_queries: TerminalQueryAuthority,
+    answers_queries: bool,
+    /// Creation order within the connection; the oldest attach on a
+    /// terminal answers queries when nothing else decides.
+    seq: u64,
 }
 
 fn error(id: String, code: &str, message: String) -> String {
@@ -86,8 +128,11 @@ impl HeadlessServer {
 
         let id = msg.request.id.clone();
         let response = match &msg.request.method {
-            Method::ControlOpen(_) => self.control_open(id, msg.control.as_ref()),
+            Method::ControlOpen(params) => {
+                self.control_open(id, msg.control.as_ref(), params.client.clone())
+            }
             Method::ControlClose(_) => self.control_close(id, msg.control.as_ref()),
+            Method::ControlList(_) => self.control_list(id, msg.control.as_ref()),
             Method::TerminalAttach(params) => {
                 self.control_terminal_attach(id, msg.control.as_ref(), params)
             }
@@ -108,9 +153,75 @@ impl HeadlessServer {
             Method::TabSetGeometry(params) => {
                 self.control_tab_set_geometry(id, msg.control.as_ref(), params)
             }
+            Method::TabClaimGeometry(params) => {
+                self.control_tab_claim_geometry(id, msg.control.as_ref(), params)
+            }
+            // A stream bootstraps from the same rectangles its `tab.layout`
+            // records carry, not the TUI's view area.
+            Method::SessionSnapshot(_) if msg.control.as_ref().is_some_and(|h| h.id() != 0) => {
+                self.control_session_snapshot(id)
+            }
             _ => return None,
         };
         Some(response)
+    }
+
+    fn control_session_snapshot(&self, id: String) -> String {
+        let mut snapshot = self.app.session_snapshot();
+        snapshot.layouts = self
+            .all_tab_targets()
+            .into_iter()
+            .filter_map(|target| self.control_tab_layout(target, self.current_tab_area(target)))
+            .collect();
+        success(
+            id,
+            ResponseResult::SessionSnapshot {
+                snapshot: Box::new(snapshot),
+            },
+        )
+    }
+
+    /// The area a tab is laid out in right now: its control owner's stored
+    /// size, else its owning shell client's, else the size every tab gets
+    /// from the foreground client or the headless default.
+    pub(super) fn current_tab_area(&self, target: crate::ui::TabSurfaceTarget) -> Rect {
+        if let Some(tab_id) = self.tab_id_for_target(target) {
+            if let Some(&controller) = self.tab_geometry_controllers.get(&tab_id) {
+                if let Some((cols, rows, _)) =
+                    self.control_tab_geometry_for_target(controller, target)
+                {
+                    return Rect::new(0, 0, cols, rows);
+                }
+                if let Some(client) = self.clients.get(&controller) {
+                    let (cols, rows) = client.terminal_size;
+                    return Rect::new(0, 0, cols, rows);
+                }
+            }
+        }
+        let (cols, rows) = self.effective_size;
+        Rect::new(0, 0, cols, rows)
+    }
+
+    /// The layout a `tab.layout` record carries for `target` laid out in `area`.
+    pub(super) fn control_tab_layout(
+        &self,
+        target: crate::ui::TabSurfaceTarget,
+        area: Rect,
+    ) -> Option<api::schema::PaneLayoutSnapshot> {
+        let surface = crate::ui::compute_tab_surface_for(
+            &self.app.state,
+            &self.app.terminal_runtimes,
+            Some(target),
+            area,
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        self.app.control_tab_layout_snapshot(
+            target.workspace_index,
+            target.tab_index,
+            area,
+            &surface.pane_infos,
+        )
     }
 
     fn control_connection_id(
@@ -128,7 +239,12 @@ impl HeadlessServer {
         Ok(id)
     }
 
-    fn control_open(&mut self, id: String, handle: Option<&ControlConnectionHandle>) -> String {
+    fn control_open(
+        &mut self,
+        id: String,
+        handle: Option<&ControlConnectionHandle>,
+        client: Option<ControlClientInfo>,
+    ) -> String {
         let Some(handle) = handle else {
             return error(
                 id,
@@ -146,6 +262,13 @@ impl HeadlessServer {
         let connection_id = CONTROL_CONNECTION_ID_BASE + self.next_control_connection_id;
         self.next_control_connection_id += 1;
         handle.assign_id(connection_id);
+        // No declared protocol means the original contract: one owner per
+        // terminal, no authority records.
+        let protocol = client
+            .as_ref()
+            .map(|client| client.protocol.clamp(1, CONTROL_STREAM_PROTOCOL))
+            .unwrap_or(1);
+        handle.set_protocol(protocol);
         self.control_connections.insert(
             connection_id,
             ControlConnectionState {
@@ -153,9 +276,19 @@ impl HeadlessServer {
                 attaches: HashMap::new(),
                 tab_geometry: HashMap::new(),
                 next_attach: 0,
+                client: client.clone(),
+                protocol,
             },
         );
-        info!(connection_id, "control stream opened");
+        info!(
+            connection_id,
+            protocol,
+            client = client
+                .as_ref()
+                .map(|client| client.name.as_str())
+                .unwrap_or(""),
+            "control stream opened"
+        );
         success(
             id,
             ResponseResult::ControlOpened {
@@ -164,6 +297,7 @@ impl HeadlessServer {
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities: api::default_server_capabilities(),
+                control_protocol: protocol,
             },
         )
     }
@@ -184,13 +318,84 @@ impl HeadlessServer {
         success(id, ResponseResult::Ok {})
     }
 
-    /// Drops every attach and geometry claim of a control connection.
+    fn control_list(&mut self, id: String, handle: Option<&ControlConnectionHandle>) -> String {
+        let self_connection_id = handle
+            .map(ControlConnectionHandle::id)
+            .filter(|id| *id != 0);
+        let mut ids = self.control_connections.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let connections = ids
+            .into_iter()
+            .filter_map(|connection_id| {
+                let state = self.control_connections.get(&connection_id)?;
+                let mut attaches = state
+                    .attaches
+                    .iter()
+                    .map(|(attach_id, attach)| {
+                        (
+                            attach.seq,
+                            ControlAttachInfo {
+                                attach_id: attach_id.clone(),
+                                terminal_id: attach.terminal_id.clone(),
+                                pane_id: self
+                                    .app
+                                    .resolve_terminal_target(&attach.terminal_id)
+                                    .ok()
+                                    .and_then(|target| {
+                                        self.app.public_pane_id(target.ws_idx, target.pane_id)
+                                    }),
+                                geometry: attach.geometry,
+                                answer_queries: attach.answer_queries,
+                                answers_queries: attach.answers_queries,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                attaches.sort_unstable_by_key(|(seq, _)| *seq);
+                let mut tabs = state
+                    .tab_geometry
+                    .iter()
+                    .map(|(tab_id, geometry)| ControlTabInfo {
+                        tab_id: tab_id.clone(),
+                        cols: geometry.cols,
+                        rows: geometry.rows,
+                        cell_width_px: geometry.cell_size.width_px,
+                        cell_height_px: geometry.cell_size.height_px,
+                        chrome: geometry.chrome,
+                        controller: self.tab_geometry_controllers.get(tab_id)
+                            == Some(&connection_id),
+                    })
+                    .collect::<Vec<_>>();
+                tabs.sort_unstable_by(|left, right| left.tab_id.cmp(&right.tab_id));
+                Some(ControlConnectionInfo {
+                    connection_id,
+                    control_protocol: state.protocol,
+                    client: state.client.clone(),
+                    attaches: attaches.into_iter().map(|(_, info)| info).collect(),
+                    tabs,
+                })
+            })
+            .collect();
+        success(
+            id,
+            ResponseResult::ControlList {
+                self_connection_id,
+                connections,
+            },
+        )
+    }
+
+    /// Drops every attach and geometry claim of a control connection. Tabs
+    /// it owned pass to the connection that last interacted with them, else
+    /// back to the shell client rules.
     pub(super) fn release_control_connection(&mut self, connection_id: u64) {
         let Some(state) = self.control_connections.remove(&connection_id) else {
             return;
         };
         state.handle.close();
+        let mut terminals = HashSet::new();
         for (attach_id, attach) in state.attaches {
+            terminals.insert(attach.terminal_id.clone());
             self.release_control_attach(
                 connection_id,
                 &state.handle,
@@ -199,19 +404,27 @@ impl HeadlessServer {
                 TerminalDetachReason::Closed,
             );
         }
-        // Only claims this connection still holds: another stream may have
-        // taken a tab over since, and its chrome choice stays in force.
-        let owned = state
-            .tab_geometry
-            .keys()
-            .filter(|tab_id| self.tab_geometry_controllers.get(*tab_id) == Some(&connection_id))
-            .cloned()
+        let owned = self
+            .tab_geometry_controllers
+            .iter()
+            .filter(|(_, controller)| **controller == connection_id)
+            .map(|(tab_id, _)| tab_id.clone())
             .collect::<Vec<_>>();
         self.tab_geometry_controllers
             .retain(|_, controller| *controller != connection_id);
-        self.sync_control_geometry_tabs();
         for tab_id in owned {
-            self.app.state.control_chromeless_tabs.remove(&tab_id);
+            let successor = self
+                .control_connections
+                .iter()
+                .filter_map(|(id, state)| state.tab_geometry.get(&tab_id).map(|g| (*id, *g)))
+                .max_by_key(|(_, geometry)| geometry.last_interaction);
+            if let Some((successor_id, geometry)) = successor {
+                self.claim_control_tab_geometry(successor_id, &tab_id, geometry);
+            }
+        }
+        self.sync_control_geometry_tabs();
+        for terminal_id in terminals {
+            self.sync_query_authority(&terminal_id);
         }
         // Always re-derive geometry: terminal-sized attaches released above
         // need their tabs back even when this stream held no tab claims.
@@ -222,7 +435,7 @@ impl HeadlessServer {
 
     fn release_control_attach(
         &mut self,
-        connection_id: u64,
+        _connection_id: u64,
         handle: &ControlConnectionHandle,
         attach_id: &str,
         attach: &ControlAttach,
@@ -231,9 +444,6 @@ impl HeadlessServer {
         handle.unregister_input(attach_id);
         if let Some(runtime) = self.control_runtime(&attach.terminal_id) {
             runtime.detach_raw(attach_id, reason);
-        }
-        if self.terminal_attach_owners.get(&attach.terminal_id) == Some(&connection_id) {
-            self.terminal_attach_owners.remove(&attach.terminal_id);
         }
         if attach.geometry == TerminalAttachGeometry::Terminal {
             if let Some(terminal_id) = self.terminal_id_by_string(&attach.terminal_id) {
@@ -266,27 +476,28 @@ impl HeadlessServer {
             .filter(|(_, attach)| self.control_runtime(&attach.terminal_id).is_none())
             .map(|(attach_id, _)| attach_id.clone())
             .collect::<Vec<_>>();
+        if gone.is_empty() {
+            return;
+        }
         for attach_id in gone {
             let Some(state) = self.control_connections.get_mut(&connection_id) else {
                 return;
             };
-            let Some(attach) = state.attaches.remove(&attach_id) else {
+            if state.attaches.remove(&attach_id).is_none() {
                 continue;
-            };
-            let handle = state.handle.clone();
-            handle.unregister_input(&attach_id);
-            if self.terminal_attach_owners.get(&attach.terminal_id) == Some(&connection_id) {
-                self.terminal_attach_owners.remove(&attach.terminal_id);
             }
+            state.handle.unregister_input(&attach_id);
         }
+        self.sync_control_geometry_tabs();
     }
 
-    /// Detaches every control attach on a terminal, for a takeover by
-    /// another attach or a direct terminal client.
+    /// Detaches control attaches on a terminal for a takeover, within
+    /// `scope`.
     pub(super) fn detach_control_attaches_for_terminal(
         &mut self,
         terminal_id: &str,
         reason: TerminalDetachReason,
+        scope: EvictScope,
     ) {
         let targets = self
             .control_connections
@@ -295,7 +506,10 @@ impl HeadlessServer {
                 state
                     .attaches
                     .iter()
-                    .filter(|(_, attach)| attach.terminal_id == terminal_id)
+                    .filter(|(_, attach)| {
+                        attach.terminal_id == terminal_id
+                            && scope.evicts(attach.geometry, state.protocol)
+                    })
                     .map(move |(attach_id, _)| (connection_id, attach_id.clone()))
             })
             .collect::<Vec<_>>();
@@ -309,6 +523,48 @@ impl HeadlessServer {
             let handle = state.handle.clone();
             self.release_control_attach(connection_id, &handle, &attach_id, &attach, reason);
         }
+        self.sync_query_authority(terminal_id);
+        self.sync_control_geometry_tabs();
+    }
+
+    /// Control attaches on a terminal: connection, attach id, geometry,
+    /// protocol.
+    fn control_attaches_for_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> Vec<(u64, String, TerminalAttachGeometry, u32)> {
+        self.control_connections
+            .iter()
+            .flat_map(|(&connection_id, state)| {
+                state
+                    .attaches
+                    .iter()
+                    .filter(|(_, attach)| attach.terminal_id == terminal_id)
+                    .map(move |(attach_id, attach)| {
+                        (
+                            connection_id,
+                            attach_id.clone(),
+                            attach.geometry,
+                            state.protocol,
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn terminal_has_control_attaches(&self, terminal_id: &str) -> bool {
+        self.control_connections.values().any(|state| {
+            state
+                .attaches
+                .values()
+                .any(|attach| attach.terminal_id == terminal_id)
+        })
+    }
+
+    /// A direct client or any control attach holds the terminal.
+    pub(super) fn terminal_is_attached(&self, terminal_id: &str) -> bool {
+        self.terminal_attach_owners.contains_key(terminal_id)
+            || self.terminal_has_control_attaches(terminal_id)
     }
 
     fn control_terminal_attach(
@@ -359,22 +615,76 @@ impl HeadlessServer {
             );
         }
 
-        if let Some(owner) = self.terminal_attach_owners.get(&terminal_id).copied() {
-            if owner != connection_id && !params.takeover {
-                return error(
-                    id,
-                    "terminal_attached",
-                    format!(
-                        "terminal {terminal_id} already has an attached client; retry with takeover"
-                    ),
-                );
-            }
-            if is_control_connection_id(owner) {
-                self.detach_control_attaches_for_terminal(
-                    &terminal_id,
+        // Protocol 2 tab followers share a terminal; a size owner (direct
+        // client or a terminal-geometry attach) shares with nobody, and a
+        // protocol 1 follower keeps its original one-owner contract.
+        let size_owning = params.geometry == TerminalAttachGeometry::Terminal;
+        let requester_protocol = self
+            .control_connections
+            .get(&connection_id)
+            .map(|state| state.protocol)
+            .unwrap_or(1);
+        let direct_owner = self.terminal_attach_owners.get(&terminal_id).copied();
+        let existing = self.control_attaches_for_terminal(&terminal_id);
+        // A protocol 1 stream re-attaching replaces its own earlier attach, as
+        // before sharing: it cannot be told to stop answering queries. The
+        // replacement is validated first; a refused request keeps the old attach.
+        let own = if requester_protocol <= 1 {
+            existing
+                .iter()
+                .filter(|(owner, _, _, _)| *owner == connection_id)
+                .map(|(_, attach_id, _, _)| attach_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let others = existing
+            .iter()
+            .filter(|(owner, _, _, _)| *owner != connection_id)
+            .collect::<Vec<_>>();
+        let other_size_owner = others
+            .iter()
+            .any(|(_, _, geometry, _)| *geometry == TerminalAttachGeometry::Terminal);
+        let conflict = if size_owning {
+            direct_owner.is_some() || existing.len() > own.len()
+        } else if requester_protocol <= 1 && own.is_empty() {
+            direct_owner.is_some() || !others.is_empty()
+        } else {
+            // A protocol 2 follower, or a protocol 1 replacement: only a size
+            // owner refuses; shared followers stay.
+            direct_owner.is_some() || other_size_owner
+        };
+        if conflict && !params.takeover {
+            return error(
+                id,
+                "terminal_attached",
+                format!(
+                    "terminal {terminal_id} already has an attached client; retry with takeover"
+                ),
+            );
+        }
+        if !own.is_empty() {
+            for attach_id in own {
+                let Some(state) = self.control_connections.get_mut(&connection_id) else {
+                    break;
+                };
+                let Some(attach) = state.attaches.remove(&attach_id) else {
+                    continue;
+                };
+                let handle = state.handle.clone();
+                self.release_control_attach(
+                    connection_id,
+                    &handle,
+                    &attach_id,
+                    &attach,
                     TerminalDetachReason::Takeover,
                 );
-            } else {
+            }
+            self.sync_query_authority(&terminal_id);
+            self.sync_control_geometry_tabs();
+        }
+        if params.takeover {
+            if let Some(owner) = direct_owner {
                 self.send_to_client(
                     owner,
                     ServerMessage::ServerShutdown {
@@ -383,6 +693,16 @@ impl HeadlessServer {
                 );
                 self.remove_client_and_resize_if_needed(owner);
             }
+            let scope = if size_owning {
+                EvictScope::All
+            } else {
+                EvictScope::TabFollowerTakeover
+            };
+            self.detach_control_attaches_for_terminal(
+                &terminal_id,
+                TerminalDetachReason::Takeover,
+                scope,
+            );
         }
 
         let Some(handle) = handle.cloned() else {
@@ -399,11 +719,9 @@ impl HeadlessServer {
                 "control stream is not open".into(),
             );
         };
-        let attach_id = format!(
-            "{}-{}",
-            connection_id - CONTROL_CONNECTION_ID_BASE,
-            state.next_attach
-        );
+        let protocol = state.protocol;
+        let seq = state.next_attach;
+        let attach_id = format!("{}-{}", connection_id - CONTROL_CONNECTION_ID_BASE, seq);
         state.next_attach += 1;
         let history_limit_bytes = params
             .history_limit_bytes
@@ -418,10 +736,11 @@ impl HeadlessServer {
                 terminal_id: terminal_id.clone(),
                 geometry: params.geometry,
                 history_limit_bytes,
+                answer_queries: params.answer_queries,
+                answers_queries: false,
+                seq,
             },
         );
-        self.terminal_attach_owners
-            .insert(terminal_id.clone(), connection_id);
         if params.geometry == TerminalAttachGeometry::Terminal {
             if let Some(real_terminal_id) = self.terminal_id_by_string(&terminal_id) {
                 self.app
@@ -431,7 +750,6 @@ impl HeadlessServer {
             }
         }
         let Some(runtime) = self.control_runtime(&terminal_id) else {
-            self.terminal_attach_owners.remove(&terminal_id);
             if let Some(state) = self.control_connections.get_mut(&connection_id) {
                 state.attaches.remove(&attach_id);
             }
@@ -442,6 +760,7 @@ impl HeadlessServer {
             handle.outbound(),
             Arc::new(RawTapBudget::new(DEFAULT_TAP_BUDGET_BYTES)),
             suppress,
+            protocol,
         );
         handle.register_input(attach_id.clone(), runtime.raw_input_sink());
         if params.geometry == TerminalAttachGeometry::Terminal {
@@ -467,7 +786,62 @@ impl HeadlessServer {
                 format!("terminal {terminal_id} could not be snapshotted"),
             ));
         }
+        // After the snapshot: a protocol 2 client reads its authority record
+        // once it knows the attach.
+        self.sync_query_authority(&terminal_id);
+        self.sync_control_geometry_tabs();
         String::new()
+    }
+
+    /// Picks the one attach on a terminal that answers its queries: a
+    /// protocol 1 attach first (it cannot be told to stop), then the tab's
+    /// geometry controller, then the oldest client-authority attach.
+    pub(super) fn sync_query_authority(&mut self, terminal_id: &str) {
+        let controller = self
+            .shell_geometry_controller_for_terminal(terminal_id)
+            .map(|(controller_id, _)| controller_id);
+        let mut candidates = self
+            .control_connections
+            .iter()
+            .flat_map(|(&connection_id, state)| {
+                state
+                    .attaches
+                    .iter()
+                    .filter(|(_, attach)| {
+                        attach.terminal_id == terminal_id
+                            && attach.answer_queries == TerminalQueryAuthority::Client
+                    })
+                    .map(move |(attach_id, attach)| {
+                        (connection_id, attach.seq, attach_id.clone(), state.protocol)
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(connection_id, seq, _, _)| (*connection_id, *seq));
+        let chosen = candidates
+            .iter()
+            .find(|(_, _, _, protocol)| *protocol <= 1)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(connection_id, _, _, _)| Some(*connection_id) == controller)
+            })
+            .or_else(|| candidates.first())
+            .map(|(_, _, attach_id, _)| attach_id.clone());
+        for state in self.control_connections.values_mut() {
+            for (attach_id, attach) in state.attaches.iter_mut() {
+                if attach.terminal_id == terminal_id {
+                    attach.answers_queries = chosen.as_deref() == Some(attach_id.as_str());
+                    // The input fast path drops automatic replies from
+                    // every other attach without asking the app loop.
+                    state
+                        .handle
+                        .set_input_authority(attach_id, attach.answers_queries);
+                }
+            }
+        }
+        if let Some(runtime) = self.control_runtime(terminal_id) {
+            runtime.set_raw_query_authority(chosen.as_deref());
+        }
     }
 
     fn control_terminal_detach(
@@ -502,6 +876,8 @@ impl HeadlessServer {
             &attach,
             TerminalDetachReason::Closed,
         );
+        self.sync_query_authority(&attach.terminal_id);
+        self.sync_control_geometry_tabs();
         success(id, ResponseResult::Ok {})
     }
 
@@ -605,13 +981,15 @@ impl HeadlessServer {
                 "tab.set_geometry cols and rows must be greater than 0".into(),
             );
         }
-        let Some((workspace_index, tab_index)) = self.app.parse_tab_id(&params.tab_id) else {
+        if self.app.parse_tab_id(&params.tab_id).is_none() {
             return error(id, "not_found", format!("tab {} not found", params.tab_id));
-        };
+        }
         let cell_size = crate::kitty_graphics::HostCellSize {
             width_px: params.cell_width_px,
             height_px: params.cell_height_px,
         };
+        let owns = self.tab_geometry_controllers.get(&params.tab_id) == Some(&connection_id);
+        let stamp = self.allocate_activity_stamp();
         let Some(state) = self.control_connections.get_mut(&connection_id) else {
             return error(
                 id,
@@ -619,36 +997,142 @@ impl HeadlessServer {
                 "control stream is not open".into(),
             );
         };
-        state
-            .tab_geometry
-            .insert(params.tab_id.clone(), (params.cols, params.rows, cell_size));
-        self.tab_geometry_controllers
-            .insert(params.tab_id.clone(), connection_id);
-        self.sync_control_geometry_tabs();
-        match params.chrome {
-            api::schema::TabChrome::None => {
-                self.app
-                    .state
-                    .control_chromeless_tabs
-                    .insert(params.tab_id.clone());
-            }
-            api::schema::TabChrome::Server => {
-                self.app
-                    .state
-                    .control_chromeless_tabs
-                    .remove(&params.tab_id);
-            }
+        let geometry =
+            state
+                .tab_geometry
+                .entry(params.tab_id.clone())
+                .or_insert(ControlTabGeometry {
+                    cols: params.cols,
+                    rows: params.rows,
+                    cell_size,
+                    chrome: params.chrome,
+                    last_interaction: stamp,
+                });
+        geometry.cols = params.cols;
+        geometry.rows = params.rows;
+        geometry.cell_size = cell_size;
+        geometry.chrome = params.chrome;
+        if params.claim {
+            geometry.last_interaction = stamp;
         }
+        let geometry = *geometry;
+        if params.claim || owns {
+            self.claim_control_tab_geometry(connection_id, &params.tab_id, geometry);
+        } else {
+            // Stored only: the size applies when this stream claims later.
+            self.sync_control_geometry_tabs();
+        }
+        success(id, ResponseResult::Ok {})
+    }
+
+    fn control_tab_claim_geometry(
+        &mut self,
+        id: String,
+        handle: Option<&ControlConnectionHandle>,
+        params: &TabClaimGeometryParams,
+    ) -> String {
+        let connection_id = match self.control_connection_id(handle) {
+            Ok(connection_id) => connection_id,
+            Err(message) => return error(id, "control_stream_required", message),
+        };
+        let tab_id = match (&params.tab_id, &params.attach_id) {
+            (Some(tab_id), _) => tab_id.clone(),
+            (None, Some(attach_id)) => {
+                let terminal_id = self
+                    .control_connections
+                    .get(&connection_id)
+                    .and_then(|state| state.attaches.get(attach_id))
+                    .map(|attach| attach.terminal_id.clone());
+                let Some(terminal_id) = terminal_id else {
+                    return error(
+                        id,
+                        "unknown_attach",
+                        format!("attach {attach_id} is not live"),
+                    );
+                };
+                let Some(tab_id) = self
+                    .tab_target_for_terminal(&terminal_id)
+                    .and_then(|target| self.tab_id_for_target(target))
+                else {
+                    return error(
+                        id,
+                        "not_found",
+                        format!("terminal {terminal_id} is not in a tab"),
+                    );
+                };
+                tab_id
+            }
+            (None, None) => {
+                return error(
+                    id,
+                    "invalid_request",
+                    "tab.claim_geometry needs tab_id or attach_id".into(),
+                );
+            }
+        };
+        if self.app.parse_tab_id(&tab_id).is_none() {
+            return error(id, "not_found", format!("tab {tab_id} not found"));
+        }
+        let stamp = self.allocate_activity_stamp();
+        let Some(geometry) = self
+            .control_connections
+            .get_mut(&connection_id)
+            .and_then(|state| state.tab_geometry.get_mut(&tab_id))
+        else {
+            return error(
+                id,
+                "no_geometry",
+                format!("no size stored for tab {tab_id}; send tab.set_geometry first"),
+            );
+        };
+        geometry.last_interaction = stamp;
+        let geometry = *geometry;
+        self.claim_control_tab_geometry(connection_id, &tab_id, geometry);
+        success(id, ResponseResult::Ok {})
+    }
+
+    /// Makes a control connection the tab's geometry controller and lays
+    /// the tab out at its stored size.
+    fn claim_control_tab_geometry(
+        &mut self,
+        connection_id: u64,
+        tab_id: &str,
+        geometry: ControlTabGeometry,
+    ) {
+        let Some((workspace_index, tab_index)) = self.app.parse_tab_id(tab_id) else {
+            return;
+        };
+        self.set_tab_geometry_controller(tab_id, Some(connection_id));
         self.apply_control_tab_geometry(
             crate::ui::TabSurfaceTarget {
                 workspace_index,
                 tab_index,
             },
-            params.cols,
-            params.rows,
-            cell_size,
+            geometry.cols,
+            geometry.rows,
+            geometry.cell_size,
         );
-        success(id, ResponseResult::Ok {})
+    }
+
+    /// The one write path for `tab_geometry_controllers`.
+    pub(super) fn set_tab_geometry_controller(&mut self, tab_id: &str, controller: Option<u64>) {
+        match controller {
+            Some(controller) => {
+                self.tab_geometry_controllers
+                    .insert(tab_id.to_owned(), controller);
+            }
+            None => {
+                self.tab_geometry_controllers.remove(tab_id);
+            }
+        }
+        self.sync_control_geometry_tabs();
+    }
+
+    /// Drops stored sizes for tabs that no longer exist.
+    pub(super) fn prune_control_tab_geometry(&mut self, keep: impl Fn(&str) -> bool) {
+        for state in self.control_connections.values_mut() {
+            state.tab_geometry.retain(|tab_id, _| keep(tab_id));
+        }
     }
 
     /// Resolves a terminal id string to its runtime through the pane path
@@ -751,20 +1235,7 @@ impl HeadlessServer {
     /// `area` to every control stream. The record travels the same ordered
     /// lane as raw output; `with_tab_layout_boundary` makes that order hold.
     fn push_control_tab_layout(&self, target: crate::ui::TabSurfaceTarget, area: Rect) {
-        let surface = crate::ui::compute_tab_surface_for(
-            &self.app.state,
-            &self.app.terminal_runtimes,
-            Some(target),
-            area,
-            false,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
-        let Some(layout) = self.app.control_tab_layout_snapshot(
-            target.workspace_index,
-            target.tab_index,
-            area,
-            &surface.pane_infos,
-        ) else {
+        let Some(layout) = self.control_tab_layout(target, area) else {
             return;
         };
         let Ok(line) = serde_json::to_string(&api::schema::ControlRecord::TabLayout { layout })
@@ -791,8 +1262,11 @@ impl HeadlessServer {
             .tab_geometry(&tab_id)
     }
 
-    /// Mirrors control-owned claims into `AppState` for `crate::ui`. Call
-    /// after every mutation of `tab_geometry_controllers`.
+    /// Mirrors `tab_geometry_controllers` into everything derived from it:
+    /// the control-owned and chromeless tab sets for `crate::ui`, the
+    /// controller each layout snapshot reports (announcing changes), the
+    /// input-claim flags of every stream, and query authority on tabs that
+    /// changed hands. Call after every mutation of `tab_geometry_controllers`.
     pub(super) fn sync_control_geometry_tabs(&mut self) {
         self.app.state.control_geometry_tabs = self
             .tab_geometry_controllers
@@ -800,6 +1274,122 @@ impl HeadlessServer {
             .filter(|(_, controller)| is_control_connection_id(**controller))
             .map(|(tab_id, _)| tab_id.clone())
             .collect();
+
+        let mut controllers = HashMap::new();
+        let mut chromeless = HashSet::new();
+        for (tab_id, &controller) in &self.tab_geometry_controllers {
+            let info = if is_control_connection_id(controller) {
+                let chrome = self
+                    .control_connections
+                    .get(&controller)
+                    .and_then(|state| state.tab_geometry.get(tab_id))
+                    .map(|geometry| geometry.chrome)
+                    .unwrap_or_default();
+                if chrome == TabChrome::None {
+                    chromeless.insert(tab_id.clone());
+                }
+                GeometryController {
+                    kind: GeometryControllerKind::Control,
+                    connection_id: Some(controller),
+                    chrome,
+                }
+            } else {
+                GeometryController {
+                    kind: GeometryControllerKind::Client,
+                    connection_id: Some(controller),
+                    chrome: TabChrome::Server,
+                }
+            };
+            controllers.insert(tab_id.clone(), info);
+        }
+        self.app.state.control_chromeless_tabs = chromeless;
+
+        let previous = std::mem::replace(
+            &mut self.app.state.control_tab_geometry_controllers,
+            controllers.clone(),
+        );
+        let mut changed_tabs = Vec::new();
+        for (tab_id, info) in &controllers {
+            if previous.get(tab_id) != Some(info) {
+                changed_tabs.push((tab_id.clone(), info.clone(), previous.get(tab_id).cloned()));
+            }
+        }
+        for (tab_id, info) in &previous {
+            if !controllers.contains_key(tab_id) {
+                changed_tabs.push((
+                    tab_id.clone(),
+                    GeometryController::default(),
+                    Some(info.clone()),
+                ));
+            }
+        }
+        changed_tabs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (tab_id, info, previous) in &changed_tabs {
+            self.app
+                .emit_tab_geometry_changed(tab_id.clone(), info.clone(), previous.clone());
+        }
+
+        // Input claims: an attach whose tab this stream sized but does not
+        // own takes the tab on the next keystroke.
+        let attach_tabs = self
+            .control_connections
+            .iter()
+            .flat_map(|(&connection_id, state)| {
+                state.attaches.iter().map(move |(attach_id, attach)| {
+                    (connection_id, attach_id.clone(), attach.terminal_id.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut tab_by_terminal: HashMap<String, Option<String>> = HashMap::new();
+        let mut flags: HashMap<u64, HashSet<String>> = HashMap::new();
+        for (connection_id, attach_id, terminal_id) in &attach_tabs {
+            let tab_id = tab_by_terminal
+                .entry(terminal_id.clone())
+                .or_insert_with(|| {
+                    self.tab_target_for_terminal(terminal_id)
+                        .and_then(|target| self.tab_id_for_target(target))
+                })
+                .clone();
+            let Some(tab_id) = tab_id else {
+                continue;
+            };
+            let stored = self
+                .control_connections
+                .get(connection_id)
+                .is_some_and(|state| state.holds_tab(&tab_id));
+            let owns = self.tab_geometry_controllers.get(&tab_id) == Some(connection_id);
+            if stored && !owns {
+                flags
+                    .entry(*connection_id)
+                    .or_default()
+                    .insert(attach_id.clone());
+            }
+        }
+        for (&connection_id, state) in &self.control_connections {
+            state
+                .handle
+                .set_claim_on_input(flags.remove(&connection_id).unwrap_or_default());
+        }
+
+        if !changed_tabs.is_empty() {
+            let changed = changed_tabs
+                .iter()
+                .map(|(tab_id, _, _)| tab_id.clone())
+                .collect::<HashSet<_>>();
+            let terminals = attach_tabs
+                .iter()
+                .filter(|(_, _, terminal_id)| {
+                    tab_by_terminal
+                        .get(terminal_id)
+                        .and_then(|tab_id| tab_id.as_ref())
+                        .is_some_and(|tab_id| changed.contains(tab_id))
+                })
+                .map(|(_, _, terminal_id)| terminal_id.clone())
+                .collect::<HashSet<_>>();
+            for terminal_id in terminals {
+                self.sync_query_authority(&terminal_id);
+            }
+        }
     }
 
     pub(super) fn control_connection_holds_tab(&self, controller_id: u64, tab_id: &str) -> bool {
@@ -808,11 +1398,14 @@ impl HeadlessServer {
             .is_some_and(|state| state.holds_tab(tab_id))
     }
 
+    /// Control connections that currently own a tab's geometry, for the
+    /// single-client fast path.
     pub(super) fn control_connections_with_tab_claims(&self) -> usize {
-        self.control_connections
+        self.tab_geometry_controllers
             .values()
-            .filter(|state| state.has_tab_claims())
-            .count()
+            .filter(|controller| is_control_connection_id(**controller))
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     pub(super) fn control_connection_ids(&self) -> impl Iterator<Item = u64> + '_ {

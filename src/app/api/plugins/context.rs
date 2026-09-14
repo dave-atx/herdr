@@ -119,6 +119,11 @@ impl App {
             | EventData::TabFocused {
                 tab_id,
                 workspace_id,
+            }
+            | EventData::TabGeometryChanged {
+                tab_id,
+                workspace_id,
+                ..
             } => self
                 .plugin_context_for_tab_id(tab_id, correlation_id)
                 .or_else(|| self.plugin_context_for_workspace_id(workspace_id, correlation_id))

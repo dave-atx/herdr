@@ -467,9 +467,19 @@ impl TerminalRuntime {
         outbound: crate::api::control::ControlOutboundSender,
         budget: std::sync::Arc<crate::pane::raw_stream::RawTapBudget>,
         suppress_terminal_responses: bool,
+        protocol: u32,
     ) {
-        self.0
-            .attach_raw(attach_id, outbound, budget, suppress_terminal_responses)
+        self.0.attach_raw(
+            attach_id,
+            outbound,
+            budget,
+            suppress_terminal_responses,
+            protocol,
+        )
+    }
+
+    pub(crate) fn set_raw_query_authority(&self, attach_id: Option<&str>) {
+        self.0.set_raw_query_authority(attach_id)
     }
 
     pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
@@ -626,6 +636,14 @@ impl TerminalRuntime {
 
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         self.0.test_process_pty_bytes(bytes);
+    }
+
+    pub(crate) fn raw_query_authority_for_test(&self) -> Option<String> {
+        self.0.raw_query_authority_for_test()
+    }
+
+    pub(crate) fn suppresses_terminal_responses_for_test(&self) -> bool {
+        self.0.suppresses_terminal_responses_for_test()
     }
 
     pub(crate) fn test_with_scrollback_bytes(
