@@ -146,16 +146,19 @@ jobs:
           body: |
             Fork test build of Herdr for the Rootshell control-stream work.
 
-            Built from commit `${{ github.sha }}`. This release is not part of the official Herdr update channel. Download the asset for your platform and keep the official binary available for rollback.
+            Control protocol 2 adds shared pane attaches, geometry ownership, client identity, query authority, and event-gap reporting. Existing protocol 1 clients retain their default behavior; protocol 2 clients opt in and check the advertised control_features.
+
+            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.3`.
+
+            Updating the binary keeps compatible running servers active. Save work, then restart the server to enable protocol 2; stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Experimental live handoff is not recommended for this test release.
 
             Install on macOS/Linux:
             ```sh
             curl -fsSL https://github.com/kitknox/herdr/releases/download/rootshell-channel/install.sh | sh
             ```
-            Open a new terminal after installation. Future upgrades: `herdr update`.
-            Save your work before restarting existing servers to enable new server features; stopping a server terminates pane processes.
+            Open a new terminal after installation. Windows users should download and extract the ZIP and keep the app-local ConPTY runtime with herdr.exe.
 
-            Validation: the local macOS suite passed 3,166 tests. Two live-handoff tests also fail on the pre-release branch head (socket error and unmanaged-agent detection timeout). Experimental live handoff is not recommended for this test release; use a normal server restart after saving work.
+            Built from commit `${{ github.sha }}`. This fork uses its own update channel; preserve the official installation for rollback.
           files: release-assets/*
 
       - name: Publish fork update channel
