@@ -25,7 +25,7 @@ esac
 case "${SHELL:-}" in
     */zsh) profile=${ZDOTDIR:-$HOME}/.zshrc; line='export PATH="$HOME/.local/opt/herdr-rootshell/bin:$PATH" # rootshell-herdr' ;;
     */bash) profile=$HOME/.bashrc; line='export PATH="$HOME/.local/opt/herdr-rootshell/bin:$PATH" # rootshell-herdr' ;;
-    */fish) profile=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/rootshell-herdr.fish; line='fish_add_path $HOME/.local/opt/herdr-rootshell/bin # rootshell-herdr' ;;
+    */fish) profile=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/rootshell-herdr.fish; line='fish_add_path --path $HOME/.local/opt/herdr-rootshell/bin # rootshell-herdr' ;;
     *) echo 'Use this installer from a bash, zsh, or fish login account.' >&2; exit 1 ;;
 esac
 asset=herdr-$os-$arch
