@@ -469,3 +469,121 @@ fn control_streams_share_a_pane_and_geometry_follows_the_last_interaction() {
     drop(server);
     cleanup_test_base(&base);
 }
+
+/// A program which misses the first SIGWINCH must converge without another
+/// keystroke or ownership change. Both streams must remain attached throughout.
+#[test]
+fn handoff_recovers_missed_resize_notification_without_changing_input() {
+    use base64::Engine as _;
+    let base = unique_test_dir();
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    let api = runtime.join("herdr.sock");
+    let server = spawn_server(&config, &runtime, &api);
+    wait_for_socket(&api, Duration::from_secs(10));
+    let (pane, tab) = create_pane(&api, "resize-notification");
+    let script = base.join("resize-child.py");
+    let log = base.join("resize-events");
+    let arm = base.join("miss-first");
+    fs::write(
+        &script,
+        r#"import os, signal, sys, tty
+from pathlib import Path
+root = Path(sys.argv[1])
+log = os.open(root / 'resize-events', os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+def note(text):
+    os.write(log, (text + '\n').encode())
+def resized(*_):
+    size = os.get_terminal_size(0)
+    if (root / 'miss-first').exists():
+        (root / 'miss-first').unlink()
+        note('missed')
+    else:
+        note('redraw %d %d' % (size.columns, size.lines))
+tty.setraw(0)
+signal.signal(signal.SIGWINCH, resized)
+note('ready')
+while True:
+    data = os.read(0, 1024)
+    if not data:
+        break
+    note('input ' + data.hex())
+"#,
+    )
+    .unwrap();
+    pane_input(
+        &api,
+        &pane,
+        &format!("exec python3 '{}' '{}'", script.display(), base.display()),
+    );
+    let wait_log = |needle: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            if text.lines().any(|line| line == needle) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("missing {needle:?}: {:?}", fs::read_to_string(&log));
+    };
+    wait_log("ready");
+    let mut a = ControlStream::open(&api, Some("phone"));
+    let mut b = ControlStream::open(&api, Some("tablet"));
+    let attach = format!(r#"{{"target":"{pane}","answer_queries":"server"}}"#);
+    let aa = a.request("attach", "terminal.attach", &attach);
+    let bb = b.request("attach", "terminal.attach", &attach);
+    assert_eq!(aa["result"]["type"], "terminal_attached");
+    assert_eq!(bb["result"]["type"], "terminal_attached");
+    let geometry = |cols, rows| {
+        format!(r#"{{"tab_id":"{tab}","cols":{cols},"rows":{rows},"chrome":"none","claim":true}}"#)
+    };
+    assert_eq!(
+        a.request("phone", "tab.set_geometry", &geometry(52, 28))["result"]["type"],
+        "ok"
+    );
+    wait_log("redraw 52 28");
+    // Let the setup resize's follow-up complete before arming the missed event.
+    thread::sleep(Duration::from_millis(500));
+    fs::write(&log, "").unwrap();
+    fs::write(&arm, "armed").unwrap();
+    assert_eq!(
+        b.request("tablet", "tab.set_geometry", &geometry(95, 45))["result"]["type"],
+        "ok"
+    );
+    let input = serde_json::json!({
+        "attach_id": bb["result"]["attach_id"],
+        "bytes": base64::engine::general_purpose::STANDARD.encode(b"real-input")
+    });
+    assert_eq!(
+        b.request("key", "terminal.input", &input.to_string())["result"]["type"],
+        "ok"
+    );
+    wait_log("missed");
+    wait_log("redraw 95 45");
+    wait_log("input 7265616c2d696e707574");
+    let text = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("input "))
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .filter(|line| line.starts_with("redraw "))
+            .all(|line| line == "redraw 95 45"),
+        "{text}"
+    );
+    for client in [&a, &b] {
+        assert!(client
+            .drain()
+            .iter()
+            .all(|line| line["type"] != "terminal.detached"));
+    }
+    drop(a);
+    drop(b);
+    drop(server);
+    cleanup_test_base(&base);
+}

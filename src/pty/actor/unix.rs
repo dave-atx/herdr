@@ -18,6 +18,11 @@ use crate::pty::fd;
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+// TIOCSWINSZ sends the first SIGWINCH immediately. A control-client takeover
+// also queues input at that boundary; applications that miss that notification
+// can otherwise keep a cached grid indefinitely. Send one more notification
+// after the latest resize settles, without changing the grid or input stream.
+const RESIZE_NOTIFY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -416,6 +421,7 @@ impl PtyIoActor {
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
+            resize_notify_at: None,
             wake_read_fd: wake_pipe.read_fd,
             controls,
             response_order,
@@ -450,6 +456,7 @@ struct PtyIoActorRunner {
     current_write_offset: usize,
     active_submission: Option<ActiveSubmission>,
     pending_handoff: Option<std_mpsc::Sender<std::io::Result<()>>>,
+    resize_notify_at: Option<Instant>,
     wake_read_fd: OwnedFd,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
@@ -511,6 +518,7 @@ impl PtyIoActorRunner {
             }
 
             self.apply_pending_controls();
+            self.notify_settled_resize();
 
             if !self.pending_writes.is_empty() {
                 match self.flush_pending_writes_once() {
@@ -773,6 +781,7 @@ impl PtyIoActorRunner {
                 let _ = self.flush_pending_writes_once()?;
             }
         }
+        self.resize_notify_at = None;
         self.state = ActorState::Quiesced;
         Ok(())
     }
@@ -898,18 +907,41 @@ impl PtyIoActorRunner {
     }
 
     fn poll_timeout_ms(&self) -> i32 {
-        let Some(ActiveSubmission {
-            phase: SubmissionPhase::WaitingUntil(deadline),
-            ..
-        }) = self.active_submission.as_ref()
-        else {
-            return ACTOR_IDLE_POLL_MS;
+        let submission_deadline = match self.active_submission.as_ref() {
+            Some(ActiveSubmission {
+                phase: SubmissionPhase::WaitingUntil(deadline),
+                ..
+            }) => Some(*deadline),
+            _ => None,
         };
-        deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .max(1)
-            .min(ACTOR_IDLE_POLL_MS as u128) as i32
+        submission_deadline
+            .into_iter()
+            .chain(self.resize_notify_at)
+            .min()
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .max(1)
+                    .min(ACTOR_IDLE_POLL_MS as u128) as i32
+            })
+            .unwrap_or(ACTOR_IDLE_POLL_MS)
+    }
+
+    fn notify_settled_resize(&mut self) {
+        if self.state != ActorState::Running {
+            self.resize_notify_at = None;
+            return;
+        }
+        if self
+            .resize_notify_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.resize_notify_at = None;
+            if let Err(err) = fd::notify_pty_resize(self.file.as_raw_fd()) {
+                debug!(pane = self.pane_id, err = %err, "PTY resize notification failed");
+            }
+        }
     }
 
     fn fail_active_submission(&mut self, err: std::io::Error) {
@@ -963,14 +995,21 @@ impl PtyIoActorRunner {
         Ok(None)
     }
 
-    fn resize(&self, resize: PtyResize) {
-        self.log_resize_result(fd::resize_pty_fd(
+    fn resize(&mut self, resize: PtyResize) {
+        // Cancel an earlier deadline even if this ioctl fails: a retry must
+        // never notify a superseded size or a PTY being handed to another actor.
+        self.resize_notify_at = None;
+        let result = fd::resize_pty_fd(
             self.file.as_raw_fd(),
             resize.rows,
             resize.cols,
             resize.cell_width_px,
             resize.cell_height_px,
-        ));
+        );
+        if result.is_ok() && self.state == ActorState::Running {
+            self.resize_notify_at = Some(Instant::now() + RESIZE_NOTIFY_DELAY);
+        }
+        self.log_resize_result(result);
     }
 
     fn nudge(&mut self, resize: PtyResize) {
@@ -1106,6 +1145,7 @@ mod tests {
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
+            resize_notify_at: None,
             wake_read_fd: wake_pipe.read_fd,
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
@@ -1114,6 +1154,116 @@ mod tests {
             poll_observer: None,
         };
         (runner, peer)
+    }
+
+    fn actor_runner_with_pty() -> (PtyIoActorRunner, OwnedFd) {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        runner.file = unsafe { std::fs::File::from_raw_fd(master) };
+        (runner, unsafe { OwnedFd::from_raw_fd(slave) })
+    }
+
+    #[test]
+    fn settled_resize_notification_keeps_latest_grid_and_preserves_input() {
+        let (mut runner, slave) = actor_runner_with_pty();
+        let phone = PtyResize {
+            rows: 28,
+            cols: 52,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        };
+        let tablet = PtyResize {
+            rows: 45,
+            cols: 95,
+            ..phone
+        };
+        runner.resize(phone);
+        assert!(runner.resize_notify_at.is_some());
+        // Make the phone notification due, then supersede it before dispatch.
+        runner.resize_notify_at = Some(Instant::now() - Duration::from_millis(1));
+        runner.enqueue_write(Bytes::from_static(b"real-input"));
+        runner.resize(tablet);
+        let deadline = runner
+            .resize_notify_at
+            .expect("tablet notification scheduled");
+        assert!(deadline > Instant::now());
+        assert!(runner.poll_timeout_ms() <= RESIZE_NOTIFY_DELAY.as_millis() as i32);
+        runner.notify_settled_resize();
+        assert_eq!(runner.resize_notify_at, Some(deadline));
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!((size.ws_row, size.ws_col), (45, 95));
+        runner.resize_notify_at = Some(Instant::now() - Duration::from_millis(1));
+        runner.notify_settled_resize();
+        assert!(runner.resize_notify_at.is_none());
+        runner.notify_settled_resize();
+        assert!(
+            runner.resize_notify_at.is_none(),
+            "one follow-up, not a repeating timer"
+        );
+        assert_eq!(runner.pending_writes.len(), 1);
+        assert_eq!(runner.pending_writes[0].bytes.as_ref(), b"real-input");
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!(
+            (size.ws_row, size.ws_col),
+            (45, 95),
+            "notification must not jiggle the grid"
+        );
+    }
+
+    #[test]
+    fn coalesced_return_to_same_size_still_schedules_notification() {
+        let (mut runner, _slave) = actor_runner_with_pty();
+        let phone = PtyResize {
+            rows: 28,
+            cols: 52,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        };
+        runner.resize(phone);
+        runner.resize_notify_at = None;
+        // The control slot can collapse A -> B -> A before the actor runs.
+        // TIOCSWINSZ(A) is now a no-op; the follow-up must still be scheduled.
+        runner.resize(phone);
+        assert!(runner.resize_notify_at.is_some());
+    }
+
+    #[test]
+    fn failed_resize_and_handoff_cancel_pending_notification() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        runner.resize_notify_at = Some(Instant::now());
+        runner.resize(PtyResize {
+            rows: 45,
+            cols: 95,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        });
+        assert!(runner.resize_notify_at.is_none(), "socket is not a PTY");
+        for state in [ActorState::Quiesced, ActorState::Released] {
+            runner.state = state;
+            runner.resize_notify_at = Some(Instant::now());
+            runner.notify_settled_resize();
+            assert!(runner.resize_notify_at.is_none());
+        }
     }
 
     #[test]
@@ -1677,6 +1827,7 @@ mod tests {
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
+            resize_notify_at: None,
             wake_read_fd: wake_pipe.read_fd,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
@@ -1810,6 +1961,7 @@ mod tests {
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
+            resize_notify_at: None,
             wake_read_fd: fd::create_wake_pipe().expect("wake pipe").read_fd,
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),

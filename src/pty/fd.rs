@@ -216,6 +216,24 @@ pub(crate) fn poll_pty_and_wake(
     }
 }
 
+/// Re-notify the current foreground job without changing PTY geometry.
+/// Look up the group when sending, rather than retaining a PID across a shell
+/// job transition. Never pass the special kill(2) targets 0 or -1.
+#[cfg(unix)]
+pub(crate) fn notify_pty_resize(fd: RawFd) -> std::io::Result<()> {
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    if pgid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pgid <= 1 {
+        return Ok(());
+    }
+    if unsafe { libc::kill(-pgid, libc::SIGWINCH) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn resize_pty_fd(
     fd: RawFd,
